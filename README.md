@@ -355,3 +355,18 @@ manifests.
   responsibility.
 - **Statistics:** intervals are unadjusted percentile bootstrap; multiplicity adjustment applies to
   the bootstrap p-values only. Preregister primary contrasts and minimum effects before collection.
+
+## Keyless Gemini on Google Cloud
+
+Use Vertex AI with Application Default Credentials instead of a Gemini API key:
+
+```sh
+pip install -e '.[gcp]'
+auspicious run --provider vertex --project YOUR_PROJECT --location global \
+  --model gemini-3.8-flash --thinking-level LOW --max-output-tokens 1536 \
+  --trials runs/pilot.jsonl --out runs/vertex-pilot --concurrency 8 --rpm 120
+```
+
+For experiments that continue while the local PC is off, the Cloud Run worker saves SQLite
+checkpoints and final raw responses, input materials, analysis tables and checksums to private
+Cloud Storage. See [cloud setup, budgets and download instructions](cloud/README.md).

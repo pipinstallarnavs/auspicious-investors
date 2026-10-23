@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "data_path": "../data/stimuli.json",
+  "mode": "exploratory",
+  "seed": 42,
+  "languages": ["en", "hi", "ta", "gu", "bn"],
+  "festivals": ["dhanteras", "akshaya_tritiya", "muhurat", "pitru_paksha"],
+  "roles": ["investor", "advisor"],
+  "personas": ["unspecified"],
+  "scenarios": ["emergency_buffer", "retirement_growth", "education_payment", "income_reserve", "home_deposit", "diversification", "wedding_fund", "child_future", "business_dues", "annual_bonus", "parent_care", "inflation_protection"],
+  "paraphrases": ["direct"],
+  "cues": ["festival_named"],
+  "controls": ["no_calendar", "occasion_control", "purchase_control"],
+  "templates": ["t1"],
+  "replicates": 1
+}

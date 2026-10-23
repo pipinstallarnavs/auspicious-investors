@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
+gcp = ["google-auth>=2.29,<3", "requests>=2.32,<3", "google-cloud-storage>=2.18,<4"]
 openweights = ["numpy>=1.26", "torch>=2.2", "transformers>=4.45,<5", "safetensors>=0.4"]
 
 [project.scripts]

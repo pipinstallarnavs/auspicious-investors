@@ -234,7 +234,7 @@ def _select_trials(trials, limit):
 
 
 def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurrency=2,
-               limit=None, retry_errors=False):
+               limit=None, retry_errors=False, checkpoint=None):
     trials = read_jsonl(trials_path)
     validate_trials(trials, confirmatory=confirmatory,
                     review_context=load_review_context(trials_path, confirmatory))
@@ -298,6 +298,8 @@ def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurr
                 return {"trial": trial, "result": result}
 
             executed = 0
+            if checkpoint is not None:
+                checkpoint(connection, directory, force=True)
             try:
                 # Bound in-flight jobs, rather than enqueueing an entire factorial grid.
                 with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
@@ -315,12 +317,16 @@ def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurr
                                                (record["trial"]["trial_id"], record["result"]["status"], canonical(record)))
                             connection.commit()
                             executed += 1
+                            if checkpoint is not None:
+                                checkpoint(connection, directory)
                             trial = next(iterator, None)
                             if trial is not None:
                                 futures[executor.submit(execute, trial)] = trial["trial_id"]
             finally:
                 rows = [strict_json(row[0]) for row in connection.execute("SELECT record FROM results ORDER BY trial_id")]
                 write_jsonl(directory / "records.jsonl", rows)
+                if checkpoint is not None:
+                    checkpoint(connection, directory, force=True)
             counts = {}
             for row in rows:
                 status = row["result"]["status"]

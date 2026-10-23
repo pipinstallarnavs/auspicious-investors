@@ -75,7 +75,8 @@ def _retry_after(headers):
 
 class GeminiProvider:
     def __init__(self, model, *, temperature=0.7, max_output_tokens=1024,
-                 seed=None, rpm=30.0, timeout=120.0, max_attempts=4):
+                 seed=None, rpm=30.0, timeout=120.0, max_attempts=4,
+                 project=None, location="global", thinking_level=None, credentials=None):
         model = model.removeprefix("models/")
         if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
             raise ValueError("Invalid Gemini model identifier")
@@ -85,7 +86,18 @@ class GeminiProvider:
             raise ValueError("rpm and timeout must be positive finite numbers")
         if max_output_tokens < 1 or max_attempts < 1:
             raise ValueError("max_output_tokens and max_attempts must be positive")
-        self._keys = load_keys()
+        if project is not None and not re.fullmatch(r"[a-z][a-z0-9-]{4,61}[a-z0-9]", project):
+            raise ValueError("Invalid Google Cloud project identifier")
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", location):
+            raise ValueError("Invalid Vertex AI location")
+        if thinking_level is not None and thinking_level not in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+            raise ValueError("thinking_level must be MINIMAL, LOW, MEDIUM or HIGH")
+        if model == "gemini-3.8-flash" and thinking_level == "MINIMAL":
+            raise ValueError("Gemini 3.8 Flash requires LOW, MEDIUM or HIGH thinking")
+        self.project, self.location = project, location
+        self._credentials = credentials
+        self._auth_lock = threading.Lock()
+        self._keys = () if project else load_keys()
         self._key_index = 0
         self._key_lock = threading.Lock()
         self._quota = _QuotaGate(rpm)
@@ -94,12 +106,39 @@ class GeminiProvider:
         self.max_attempts = max_attempts
         self.generation = {"temperature": temperature, "maxOutputTokens": max_output_tokens,
                            "responseMimeType": "application/json", "responseSchema": RESPONSE_SCHEMA}
+        if thinking_level is not None:
+            self.generation["thinkingConfig"] = {"thinkingLevel": thinking_level}
         if seed is not None:
             self.generation["seed"] = seed
-        self.identity = {"provider": "gemini", "requested_model": model,
-                         "generation": self.generation, "transport": "gemini-rest-v1beta",
+        self.identity = {"provider": "vertex_ai" if project else "gemini", "requested_model": model,
+                         "generation": self.generation,
+                         "transport": "vertex-ai-rest-v1-adc" if project else "gemini-rest-v1beta",
                          "quota_policy": "shared global gate across keys; retry same key on 429",
                          "rpm": rpm, "timeout": timeout, "max_attempts": max_attempts}
+        if project:
+            self.identity.update(project=project, location=location)
+
+    def prepare(self):
+        if self.project and self._credentials is None:
+            import google.auth
+            self._credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+
+    def _request(self, body, key):
+        headers = {"Content-Type": "application/json", "User-Agent": "auspicious-investors/0.1.0"}
+        if self.project:
+            self.prepare()
+            with self._auth_lock:
+                if not self._credentials.valid:
+                    from google.auth.transport.requests import Request
+                    self._credentials.refresh(Request())
+                headers["Authorization"] = "Bearer " + self._credentials.token
+            host = "aiplatform.googleapis.com" if self.location == "global" else f"{self.location}-aiplatform.googleapis.com"
+            url = (f"https://{host}/v1/projects/{self.project}/locations/{self.location}/"
+                   f"publishers/google/models/{self.model}:generateContent")
+        else:
+            headers["x-goog-api-key"] = key
+            url = f"{API_BASE}/models/{self.model}:generateContent"
+        return urllib.request.Request(url, data=body, headers=headers, method="POST")
 
     def generate_trial(self, trial):
         import hashlib
@@ -112,26 +151,25 @@ class GeminiProvider:
         return self._generate(prompt, self.generation.get("seed"))
 
     def _generate(self, prompt, sample_seed):
-        with self._key_lock:
-            slot = self._key_index % len(self._keys)
-            key = self._keys[slot]
-            self._key_index += 1
+        key = None
+        if self._keys:
+            with self._key_lock:
+                slot = self._key_index % len(self._keys)
+                key = self._keys[slot]
+                self._key_index += 1
         generation = dict(self.generation)
         if sample_seed is not None:
             generation["seed"] = sample_seed
         body = json.dumps({"contents": [{"role": "user", "parts": [{"text": prompt}]}],
                            "generationConfig": generation}, ensure_ascii=False).encode()
-        result = {"provider": "gemini", "requested_model": self.model,
+        result = {"provider": self.identity["provider"], "requested_model": self.model,
                   "model_version": None, "generation": self.generation,
                   "usage": {}, "attempts": 0, "status": "error", "raw_text": "",
                   "payload": None, "error": None, "attempt_log": [], "sampling_seed": sample_seed}
         for attempt in range(1, self.max_attempts + 1):
             self._quota.acquire()
             result["attempts"] = attempt
-            request = urllib.request.Request(
-                f"{API_BASE}/models/{self.model}:generateContent", data=body,
-                headers={"Content-Type": "application/json", "x-goog-api-key": key,
-                         "User-Agent": "auspicious-investors/0.1.0"}, method="POST")
+            request = self._request(body, key)
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     raw = response.read().decode("utf-8")

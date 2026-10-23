@@ -6,6 +6,7 @@ build/
 dist/
 runs/
 artifacts/
+results/
 .env
 .env.*
 *.sqlite

@@ -70,6 +70,10 @@ def parser():
         command.add_argument("--retry-errors", action="store_true",
                              help="Retry transport errors only; preserves invalid/blocked outputs")
     run.add_argument("--model", required=True)
+    run.add_argument("--provider", choices=("gemini", "vertex"), default="gemini")
+    run.add_argument("--project", help="Google Cloud project for Vertex AI; uses ADC, not an API key")
+    run.add_argument("--location", default="global")
+    run.add_argument("--thinking-level", type=str.upper, choices=("MINIMAL", "LOW", "MEDIUM", "HIGH"))
     run.add_argument("--temperature", type=float, default=0.7)
     run.add_argument("--max-output-tokens", type=int, default=1024)
     run.add_argument("--seed", type=int, default=None)
@@ -176,9 +180,14 @@ def dispatch(args):
         return list_models()
     if args.command == "run":
         from .gemini import GeminiProvider
+        if args.provider == "vertex" and not args.project:
+            raise ValueError("--provider vertex requires --project")
+        if args.provider == "gemini" and args.project:
+            raise ValueError("Use --provider vertex with --project")
         provider = GeminiProvider(args.model, temperature=args.temperature,
                                   max_output_tokens=args.max_output_tokens, seed=args.seed,
-                                  rpm=args.rpm, timeout=args.timeout, max_attempts=args.max_attempts)
+                                  rpm=args.rpm, timeout=args.timeout, max_attempts=args.max_attempts,
+                                  project=args.project, location=args.location, thinking_level=args.thinking_level)
         return run_trials(args.trials, args.out, provider, confirmatory=args.confirmatory,
                           concurrency=args.concurrency, limit=args.limit, retry_errors=args.retry_errors)
     if args.command == "run-openweights":

@@ -1,0 +1,21 @@
+{
+  "project": "YOUR_RESEARCH_PROJECT",
+  "model": "gemini-3.8-flash",
+  "design_config": "examples/vertex-pilot.json",
+  "concurrency": 12,
+  "bootstrap": 2000,
+  "model_budget_usd": 90,
+  "pricing_valid_until": "2026-12-31",
+  "prices_usd_per_million": {"input": 0.75, "output": 3.75},
+  "pricing_source": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing (verified 2026-10-22; introductory pricing ends 2026-12-31)",
+  "generation": {
+    "location": "global",
+    "temperature": 1.0,
+    "max_output_tokens": 1536,
+    "seed": 42,
+    "rpm": 180,
+    "timeout": 120,
+    "max_attempts": 2,
+    "thinking_level": "LOW"
+  }
+}
