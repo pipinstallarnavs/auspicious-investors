@@ -1,5 +1,5 @@
 {
-  "_note": "illustrative, not a preregistration",
+  "_note": "Descriptive illustration only, not externally registered; cannot enable confirmatory collection or significance.",
   "schema_version": 1,
   "return_tolerance_pp": 0.01,
   "primary": [
@@ -8,16 +8,26 @@
       "table": "effects",
       "metric": "gold_pct",
       "contrast": "event_minus_neutral",
-      "filters": {"source": "model", "cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "filters": {
+        "source": "model",
+        "cue": "festival_named",
+        "persona_id": "unspecified",
+        "language": "en"
+      },
       "expected_tests": 8,
       "minimum_meaningful_effect": 2.0
     },
     {
-      "id": "h2_beyond_occasion_salience_en",
+      "id": "h2_occasion_wording_robustness_en",
       "table": "effects",
       "metric": "gold_pct",
       "contrast": "event_minus_occasion_control",
-      "filters": {"source": "model", "cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "filters": {
+        "source": "model",
+        "cue": "festival_named",
+        "persona_id": "unspecified",
+        "language": "en"
+      },
       "expected_tests": 8,
       "minimum_meaningful_effect": 2.0
     },
@@ -26,7 +36,12 @@
       "table": "effects",
       "metric": "return_claim_absolute_error_pp",
       "contrast": "event_minus_neutral",
-      "filters": {"source": "model", "cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "filters": {
+        "source": "model",
+        "cue": "festival_named",
+        "persona_id": "unspecified",
+        "language": "en"
+      },
       "expected_tests": 8,
       "minimum_meaningful_effect": 0.5
     },
@@ -35,11 +50,21 @@
       "table": "language_interactions",
       "metric": "gold_pct",
       "contrast": "event_minus_neutral",
-      "filters": {"source": "model", "cue": "festival_named", "persona_id": "unspecified", "language": "hi"},
+      "filters": {
+        "source": "model",
+        "cue": "festival_named",
+        "persona_id": "unspecified",
+        "language": "hi"
+      },
       "expected_tests": 8,
       "minimum_meaningful_effect": 2.0
     }
   ],
   "primary_adjustment": "holm",
-  "exploratory_adjustment": "benjamini_hochberg"
+  "exploratory_adjustment": "benjamini_hochberg",
+  "inference_method": "descriptive",
+  "evaluation_splits": [
+    "test"
+  ],
+  "template_weighting": "equal_planned_templates_complete_case"
 }

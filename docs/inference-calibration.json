@@ -1,0 +1,96 @@
+{
+  "kind": "synthetic_inference_diagnostic",
+  "seed": 20261024,
+  "nominal_alpha": 0.05,
+  "sampling_model": "independent Normal(effect_in_scenario_sd, 1) scenario effects",
+  "test": "two-sided scenario mean sign flips; exact through 16; otherwise add-one Monte Carlo (9999)",
+  "scope": "Conditional calibration/power under the stated simulated model only. Not evidence of adequate coverage, independence, symmetry, or power for the shipped authored tasks.",
+  "small_sample_example": {
+    "effects": [
+      1,
+      2
+    ],
+    "p_value": 0.5,
+    "pipeline_p_value": null
+  },
+  "rows": [
+    {
+      "n_independent_scenarios": 2,
+      "effect_in_scenario_sd": 0,
+      "experiments": 1000,
+      "raw_test_rejections": 0,
+      "raw_test_rejection_rate": 0.0,
+      "monte_carlo_rate_wilson_95": [
+        2.168404344971009e-19,
+        0.0038267584855551234
+      ],
+      "pipeline_inference_eligible_by_cluster_count": false,
+      "pipeline_rejections_if_other_protocol_gates_satisfied": 0
+    },
+    {
+      "n_independent_scenarios": 2,
+      "effect_in_scenario_sd": 0.5,
+      "experiments": 1000,
+      "raw_test_rejections": 0,
+      "raw_test_rejection_rate": 0.0,
+      "monte_carlo_rate_wilson_95": [
+        2.168404344971009e-19,
+        0.0038267584855551234
+      ],
+      "pipeline_inference_eligible_by_cluster_count": false,
+      "pipeline_rejections_if_other_protocol_gates_satisfied": 0
+    },
+    {
+      "n_independent_scenarios": 4,
+      "effect_in_scenario_sd": 0,
+      "experiments": 1000,
+      "raw_test_rejections": 0,
+      "raw_test_rejection_rate": 0.0,
+      "monte_carlo_rate_wilson_95": [
+        2.168404344971009e-19,
+        0.0038267584855551234
+      ],
+      "pipeline_inference_eligible_by_cluster_count": false,
+      "pipeline_rejections_if_other_protocol_gates_satisfied": 0
+    },
+    {
+      "n_independent_scenarios": 4,
+      "effect_in_scenario_sd": 0.5,
+      "experiments": 1000,
+      "raw_test_rejections": 0,
+      "raw_test_rejection_rate": 0.0,
+      "monte_carlo_rate_wilson_95": [
+        2.168404344971009e-19,
+        0.0038267584855551234
+      ],
+      "pipeline_inference_eligible_by_cluster_count": false,
+      "pipeline_rejections_if_other_protocol_gates_satisfied": 0
+    },
+    {
+      "n_independent_scenarios": 12,
+      "effect_in_scenario_sd": 0,
+      "experiments": 1000,
+      "raw_test_rejections": 55,
+      "raw_test_rejection_rate": 0.055,
+      "monte_carlo_rate_wilson_95": [
+        0.04249742737476844,
+        0.07090838767737563
+      ],
+      "pipeline_inference_eligible_by_cluster_count": true,
+      "pipeline_rejections_if_other_protocol_gates_satisfied": 55
+    },
+    {
+      "n_independent_scenarios": 12,
+      "effect_in_scenario_sd": 0.5,
+      "experiments": 1000,
+      "raw_test_rejections": 333,
+      "raw_test_rejection_rate": 0.333,
+      "monte_carlo_rate_wilson_95": [
+        0.3044779033483562,
+        0.3628002339858192
+      ],
+      "pipeline_inference_eligible_by_cluster_count": true,
+      "pipeline_rejections_if_other_protocol_gates_satisfied": 333
+    }
+  ]
+}

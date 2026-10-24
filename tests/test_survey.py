@@ -70,6 +70,8 @@ class SurveyTests(unittest.TestCase):
         return path
 
     def run_assign(self, path, name="out", **kwargs):
+        kwargs.setdefault("study_id", "fixture")
+        kwargs.setdefault("assigned_at", "2020-01-01T00:00:00+00:00")
         kwargs.setdefault("participants", 40)
         kwargs.setdefault("design", "between")
         kwargs.setdefault("items_per_participant", 4)
@@ -90,7 +92,7 @@ class SurveyTests(unittest.TestCase):
             with self.subTest(design=design):
                 output, report = self.run_assign(path, name=design, design=design)
                 grouped = self.by_subject(output)
-                self.assertEqual(sorted(grouped), [f"S{n:04d}" for n in range(1, 41)])
+                self.assertEqual(sorted(grouped), [f"fixture-S{n:04d}" for n in range(1, 41)])
                 self.assertEqual(report["parameters"]["n_target_items"], 3)
                 self.assertEqual(report["parameters"]["n_filler_items"], 1)
                 for subject, rows in grouped.items():
@@ -242,7 +244,7 @@ class SurveyTests(unittest.TestCase):
         path = self.corpus(conditions=("event", "neutral", "no_calendar", "purchase_control"))
         output, _ = self.run_assign(path, design="counterbalanced", participants=12)
         survey_files = sorted((output / "surveys").glob("*.csv"))
-        self.assertEqual([p.stem for p in survey_files], [f"S{n:04d}" for n in range(1, 13)])
+        self.assertEqual([p.stem for p in survey_files], [f"fixture-S{n:04d}" for n in range(1, 13)])
         assignments = self.by_subject(output)
         forbidden = [*CLUSTERS, "dhanteras", "no_calendar", "purchase_control", "occasion_control",
                      "event", "neutral", "filler", "target", "kind", "condition", "cluster", "pair_id"]
@@ -268,7 +270,7 @@ class SurveyTests(unittest.TestCase):
         template = read_csv(output / "participants-template.csv")
         with open(output / "participants-template.csv", encoding="utf-8", newline="") as stream:
             self.assertEqual(next(csv.reader(stream)), list(PARTICIPANT_TEMPLATE_FIELDS))
-        self.assertEqual([r["subject_id"] for r in template], [f"S{n:04d}" for n in range(1, 7)])
+        self.assertEqual([r["subject_id"] for r in template], [f"fixture-S{n:04d}" for n in range(1, 7)])
         grouped = self.by_subject(output)
         for row in template:
             self.assertEqual(row["survey_language"], grouped[row["subject_id"]][0]["language"])

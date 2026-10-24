@@ -51,6 +51,7 @@ def activation_fixture(path, prompts="separable", template_by_cluster=False):
                 trials.append({
                     "trial_id": f"trial-{len(rows) - 1}", "cluster_id": f"{split}-{cluster}", "split": split,
                     "condition": "event" if label else "neutral", "prompt": text,
+                    "prompt_sha256": hashlib.sha256(text.encode()).hexdigest(),
                     "festival": "dhanteras" if cluster % 2 == 0 else "muhurat",
                     "language": "en" if k < 2 else "hi",
                     "template_id": f"t{cluster % 2 + 1}" if template_by_cluster else "t1",
@@ -61,7 +62,7 @@ def activation_fixture(path, prompts="separable", template_by_cluster=False):
         "cluster_ids": np.asarray(clusters), "splits": np.asarray(splits),
         "trial_ids": np.asarray([f"trial-{i}" for i in range(len(rows))]),
         "trials": np.asarray(json.dumps(trials)),
-        "metadata": np.asarray(json.dumps(dict(provenance(), kind="prompt_activations", event_valences=["auspicious"]))),
+        "metadata": np.asarray(json.dumps(dict(provenance(), kind="prompt_activations", event_valences=["auspicious"], trials_sha256=ow._trials_digest(trials)))),
     }
     np.savez(path, **arrays)
     return arrays
@@ -317,9 +318,9 @@ class TextBaselineTests(unittest.TestCase):
         better = ow._probe_vs_text({"accuracy": 0.9}, {"accuracy": 0.7})
         self.assertAlmostEqual(worse["difference"], -0.2)
         for report in (worse, equal):
-            self.assertIn("does not support a claim", report["interpretation"])
+            self.assertIn("condition decodability", report["interpretation"])
         self.assertAlmostEqual(better["difference"], 0.2)
-        self.assertIn("does not establish a representation claim", better["interpretation"])
+        self.assertIn("condition decodability", better["interpretation"])
 
 
 @unittest.skipIf(np is None, "numpy optional extra is not installed")
@@ -368,7 +369,7 @@ class ProbeInvariantTests(unittest.TestCase):
             self.assertEqual(report["text_baseline"]["splits"][split]["accuracy"], 0.5)
         # The activation probe (separable features by construction) is clearly above that baseline.
         self.assertEqual(report["probe_vs_text_baseline"]["difference"], 0.5)
-        self.assertIn("exceeds", report["probe_vs_text_baseline"]["interpretation"])
+        self.assertIn("condition decodability", report["probe_vs_text_baseline"]["interpretation"])
 
     def test_leave_one_value_out_transfer(self):
         report = ow.fit_probe(self.source, self.output)
@@ -406,6 +407,9 @@ class ProbeInvariantTests(unittest.TestCase):
             # Language fully confounded with condition: each language holds only one class.
             trial["language"] = "en" if trial["condition"] == "neutral" else "hi"
         arrays["trials"] = np.asarray(json.dumps(trials))
+        metadata = json.loads(arrays["metadata"].item())
+        metadata["trials_sha256"] = ow._trials_digest(trials)
+        arrays["metadata"] = np.asarray(json.dumps(metadata))
         np.savez(self.source, **arrays)
         language = ow.fit_probe(self.source, self.output)["transfer"]["language"]
         self.assertEqual(language["n_values_evaluated"], 0)
@@ -482,6 +486,9 @@ class ProbeInvariantTests(unittest.TestCase):
             if flag:
                 trial["condition"] = "neutral" if trial["condition"] == "event" else "event"
         self.arrays["trials"] = np.asarray(json.dumps(trials))
+        metadata = json.loads(self.arrays["metadata"].item())
+        metadata["trials_sha256"] = ow._trials_digest(trials)
+        self.arrays["metadata"] = np.asarray(json.dumps(metadata))
         np.savez(self.source, **self.arrays)
         report = ow.fit_probe(self.source, self.output)
         with np.load(self.output, allow_pickle=False) as artifact:
@@ -532,6 +539,37 @@ class ProbeInvariantTests(unittest.TestCase):
         for ridge in (0, -1, float("nan")):
             with self.assertRaises(ValueError):
                 ow.fit_probe(self.source, self.output, ridge=ridge)
+
+    def test_embedded_trial_and_prompt_tampering_are_rejected(self):
+        trials = json.loads(self.arrays["trials"].item())
+        trials[0]["festival"] = "edited"
+        self.arrays["trials"] = np.asarray(json.dumps(trials))
+        np.savez(self.source, **self.arrays)
+        with self.assertRaisesRegex(ValueError, "trial-content digest"):
+            ow.fit_probe(self.source, self.output)
+        trials[0]["prompt"] += " edited"
+        self.arrays["trials"] = np.asarray(json.dumps(trials))
+        np.savez(self.source, **self.arrays)
+        with self.assertRaisesRegex(ValueError, "prompt hash"):
+            ow.fit_probe(self.source, self.output)
+
+    def test_calibrated_doses_match_diagonal_standardized_displacement(self):
+        ow.fit_probe(self.source, self.output)
+        with np.load(self.output, allow_pickle=False) as artifact:
+            scale = artifact["scaler_scale"].copy()
+        for seed in (None, 7, 9):
+            direction = ow._read_steering(self.output, provenance(), seed, dose="activation_std")
+            self.assertAlmostEqual(float(np.linalg.norm(direction / scale)), 1)
+
+    def test_dev_probe_does_not_expose_test_scores_and_has_sensitivity(self):
+        report = ow.fit_probe(self.source, self.output, evaluation_split="dev")
+        self.assertNotIn("test", report["splits"])
+        self.assertNotIn("test", report["text_baseline"]["splits"])
+        self.assertEqual(report["random_direction_null"]["split"], "dev")
+        self.assertEqual(report["transfer"]["evaluation_split"], "dev")
+        self.assertEqual(len(report["training_cluster_sensitivity"]["refits"]), 3)
+        self.assertEqual(report["text_baseline"]["selection"]["status"], "dev_cluster_macro_accuracy")
+        self.assertIsNotNone(report["splits"]["dev"]["leave_one_cluster_out_macro_range"])
 
 
 @unittest.skipIf(np is None, "numpy optional extra is not installed")
@@ -849,25 +887,26 @@ class RealDecoderTests(unittest.TestCase):
         write_jsonl(path, trials)
         return path, trials
 
-    def test_steering_grid_manifest_resume_and_test_only_restriction(self):
+    def test_steering_grid_manifest_resume_and_dev_restriction(self):
         source, trials = self._grid_corpus()
         out = self.root / "grid"
         kwargs = dict(model="local-fixture", layers=[0, -1], strengths=[1.0], positions=("all", "generated"),
                       random_seeds=(7,), max_output_tokens=3, capability_limit=2)
         manifest = ow.steering_grid(source, out, **kwargs)
         self.assertTrue(manifest["complete"])
-        self.assertTrue(manifest["test_only"])
+        self.assertFalse(manifest["test_only"])
+        self.assertEqual(manifest["evaluation_split"], "dev")
         self.assertEqual(manifest["settings"]["layers_resolved"], [0, 1])
         # per layer: baseline + 2 positions x (learned + 1 random seed)
         self.assertEqual(manifest["n_runs"], 2 * (1 + 2 * 2))
         kinds = sorted(run["kind"] for run in manifest["runs"])
         self.assertEqual(kinds, ["baseline"] * 2 + ["learned"] * 4 + ["random"] * 4)
-        test_trials = [t for t in trials if t["split"] == "test"]
+        test_trials = [t for t in trials if t["split"] == "dev"]
         self.assertEqual(len(test_trials), 6)
         for run in manifest["runs"]:
             self.assertEqual(sum(run["counts"].values()), len(test_trials))
             records = [json.loads(line) for line in (Path(run["dir"]) / "records.jsonl").read_text().splitlines()]
-            self.assertEqual({r["trial"]["split"] for r in records}, {"test"})
+            self.assertEqual({r["trial"]["split"] for r in records}, {"dev"})
             self.assertEqual({r["trial"]["condition"] for r in records}, {"event", "neutral", "no_calendar"})
             capability = json.loads((Path(run["dir"]) / "capability_check.json").read_text())
             generation = capability["provider_identity"]["generation"]
@@ -911,6 +950,39 @@ class RealDecoderTests(unittest.TestCase):
         self.assertEqual(refreshed["items_sha256"], hashlib.sha256(items.read_bytes()).hexdigest())
         self.assertTrue(all(run["executed"] == 0 for run in resumed["runs"]))
         self._assert_no_hooks()
+
+    def test_test_behavior_requires_one_frozen_dev_selection(self):
+        source, _ = self._grid_corpus()
+        kwargs = dict(model="local-fixture", layers=[0], strengths=[1.0], max_output_tokens=1, capability_limit=1)
+        with self.assertRaisesRegex(ValueError, "frozen dev selection"):
+            ow.steering_grid(source, self.root / "test", evaluation_split="test", **kwargs)
+        dev = ow.steering_grid(source, self.root / "dev", **kwargs)
+        self.assertTrue(dev["controls_complete"])
+        self.assertIn("paired_vs_baseline", next(r for r in dev["runs"] if r["kind"] == "learned"))
+        self.assertIn("paired_vs_learned", next(r for r in dev["runs"] if r["kind"] == "random"))
+        selected = self.root / "selection.json"
+        ow.freeze_steering_selection(dev["output"], selected, layer=0, position="all", strength=1.0)
+        test = ow.steering_grid(source, self.root / "test", evaluation_split="test", frozen_selection=selected, **kwargs)
+        self.assertTrue(test["test_only"])
+        for row in test["runs"]:
+            records = [json.loads(line) for line in (Path(row["dir"]) / "records.jsonl").read_text().splitlines()]
+            self.assertEqual({r["trial"]["split"] for r in records}, {"test"})
+        with self.assertRaisesRegex(ValueError, "exactly the frozen"):
+            ow.steering_grid(source, self.root / "multi", evaluation_split="test", frozen_selection=selected,
+                             **{**kwargs, "strengths": [1.0, 2.0]})
+        selected_data = json.loads(selected.read_text())
+        selected_data["probe_sha256"] = "changed"
+        selected.write_text(json.dumps(selected_data))
+        with self.assertRaisesRegex(ValueError, "artifact hash"):
+            ow.steering_grid(source, self.root / "tampered", evaluation_split="test", frozen_selection=selected, **kwargs)
+
+    def test_uncontrolled_grid_is_flagged_and_cannot_be_frozen(self):
+        source, _ = self._grid_corpus()
+        dev = ow.steering_grid(source, self.root / "uncontrolled", model="local-fixture", layers=[0],
+                               strengths=[1.0], random_seeds=(), capability=False, max_output_tokens=1)
+        self.assertFalse(dev["controls_complete"])
+        with self.assertRaisesRegex(ValueError, "random controls"):
+            ow.freeze_steering_selection(dev["output"], self.root / "selection.json", layer=0, position="all", strength=1.0)
 
     def test_steering_grid_rejects_bad_inputs_before_loading_a_model(self):
         source, _ = self._grid_corpus()

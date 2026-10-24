@@ -10,8 +10,7 @@ prompt language, client persona, and cue type?
 > text* on one model's output under stated inference conditions. It is not evidence that a model
 > "believes" in auspiciousness. A change in gold allocation can come from a festival→"buy gold"
 > association, accommodation of a stated cultural preference, an inferred researcher expectation,
-> or a (mistaken) financial rationale. The controls and outcome decomposition below exist to
-> separate those explanations; stronger language needs stronger evidence.
+> or a (mistaken) financial rationale. The controls are robustness checks; their wording and norm confounds leave these explanations open.
 >
 > **All shipped prompts, translations, and scenario text are draft.** Nothing has been reviewed by
 > independent bilingual domain reviewers, no calendar date is verified, and the `t2` templates are
@@ -43,7 +42,8 @@ auspicious validate --trials runs/pilot.jsonl
 export GEMINI_API_KEYS='["key-one","key-two"]'                         # or GEMINI_API_KEY
 auspicious run --trials runs/pilot.jsonl --out runs/pilot-gemini \
   --model gemini-2.5-flash --concurrency 8 --rpm 60                    # resumable
-auspicious analyze --records runs/pilot-gemini/records.jsonl --out runs/pilot-analysis
+auspicious analyze --records runs/pilot-gemini/records.jsonl --trials runs/pilot.jsonl \
+  --split train --out runs/pilot-analysis                            # exploratory train-only pilot
 ```
 
 `examples/pilot-controls.json` builds the same kind of pilot with all three control arms and both
@@ -67,8 +67,8 @@ A **pair** (shared `pair_id`) holds the same task under different calendar text.
 | `event` | Festival named (or belief sentence, or verified date) | Treatment |
 | `neutral` | "An ordinary comparison day with no designated observance" | Original baseline |
 | `no_calendar` | None (economic disclaimer kept, no calendar label) | Is "ordinary day" itself a cue? |
-| `occasion_control` | A culturally meaningful occasion with **no** auspiciousness/purchase claim | Occasion salience vs auspiciousness |
-| `purchase_control` | Gold-buying (or purchase-deferral) wording **without** any festival | Purchase association vs auspiciousness |
+| `occasion_control` | A culturally meaningful occasion with **no** auspiciousness/purchase claim | Occasion-wording robustness comparison |
+| `purchase_control` | Gold-buying (or purchase-deferral) wording **without** any festival | Purchase-norm robustness comparison |
 
 All economic parameters, role, persona, language, template and scenario are identical across a
 pair; only the calendar text varies. The existing economic disclaimer (prices, fees, returns, risk,
@@ -101,10 +101,9 @@ arm that mentions a label. `occasion_control` and `purchase_control` are not def
 
 `build` reports `distinct_prompts` and `distinct_neutral_prompts`. Neutral and control prompts are
 textually identical across festivals (different trial ids and sampling seeds), so they act as
-repeated sampling, not additional situations. **Scenario diversity, not prompt count, limits what
-the intervals can support.**
+repeated sampling, not additional situations. **Scenario diversity, not prompt count, limits generalization.**
 
-### Outcomes: three separate questions
+### Outcomes: separate questions
 
 Model output is JSON with `gold_pct`, `equity_pct`, `cash_pct`, `buy_now`, `timing_days`,
 `willingness_to_pay_inr`, `expected_return_pct`, `rationale`. Allocation must sum to 100;
@@ -134,16 +133,16 @@ rounding tolerance at the boundary. Set `return_tolerance_pp` in the preregistra
 collection, or use `analyze --return-tolerance-pp` for exploratory analysis. Analysis records the
 effective tolerance and rejects a command-line override that differs from the registered value.
 
-### What each contrast separates
+### Contrasts and robustness checks
 
 | Contrast | Reads as |
 |---|---|
 | `event_minus_neutral` (**primary**) | Calendar-cue sensitivity |
 | `event_minus_no_calendar` | Cue vs. no calendar text at all |
 | `neutral_minus_no_calendar` | Whether the "ordinary day" label itself acts as a cue |
-| `event_minus_occasion_control` | Auspiciousness vs. generic occasion salience |
-| `event_minus_purchase_control` | Auspiciousness vs. gold/purchase association |
-| persona interactions (observant − nonobservant) | Preference accommodation |
+| `event_minus_occasion_control` | Event vs. civic-occasion wording (confounded robustness check) |
+| `event_minus_purchase_control` | Event vs. purchase-norm wording (confounded robustness check) |
+| persona interactions (observant − nonobservant) | Persona-dependent sensitivity, possibly preference accommodation |
 | cue interactions (`explicit_belief` − `festival_named`) | Effect of stating the belief |
 | `return_claim_absolute_error_pp`, `return_claim_violation`, `reserve_violation` effects | Changes in return errors and violations of defined requirements |
 
@@ -154,204 +153,171 @@ Language interactions are against English on **identical** matched tasks.
 ## Analysis
 
 ```sh
-auspicious analyze --records runs/full-gemini/records.jsonl --out runs/analysis \
-  --bootstrap 2000 --prereg prereg.json
+auspicious analyze --records runs/full-gemini/records.jsonl --trials runs/full.jsonl --out runs/analysis
+# Explicit exploratory strata (kept separate): --split train --split dev --split test
 ```
 
-Estimates average repetitions within scenario, then weight scenarios equally; 95% intervals
-resample **scenarios** (not generations). More bootstrap draws cannot add scenarios.
+Analysis defaults to **test only** and keeps `split` in effect strata. Estimates average
+replicates/paraphrases within template, templates equally within subject/scenario, subjects within
+scenario, then scenarios equally. Reported effects describe surviving complete pairs; invalid answers
+are never replaced with zero. No default population confidence intervals, p-values or MME/equivalence
+claims are produced. `--bootstrap` is retained for command compatibility and cannot enable inference.
 
-Written to `--out`: `analysis.json` plus CSVs — `effects`, `language_interactions`,
-`persona_interactions`, `cue_interactions`, `scenario_effects`, `scenario_robustness`
-(n scenarios, share with the pooled sign, min/max), `template_effects` (when >1 template),
-`validity_effects`, `bounds_effects`, `missingness`, `pair_coverage`, `exclusions`,
-`record_status_totals`, and human tables when supplied (below).
+Outputs include `analysis.json`, effects/interactions, per-scenario/template diagnostics, validity,
+worst-case bounds, missingness, pair coverage, exclusions and human tables. Bounds include pairs with
+**either** condition recorded; absent records and recorded nonvalid responses have separate counts.
+Entirely absent model pairs are outside these bounds. `--trials` revalidates result metadata and input
+hashes against the original roster; the report states planned and observed coverage.
 
-- **Validity is an outcome.** `validity_effects.csv` gives P(valid) differences over *all attempted*
-  pairs plus valid-rate breakdowns by language, festival, cue, role, persona and condition.
-  Complete-case effects describe the surviving subset of tasks; if one language fails more on hard
-  scenarios its effect describes different tasks.
-- **Exclusion sensitivity.** `bounds_effects.csv` gives worst-case (Manski-type) bounds for bounded
-  metrics, imputing every non-valid side with the extreme of the metric's support. Unbounded
-  metrics are skipped with a reason. Pairs entirely absent from the results cannot be bounded.
-- **Multiplicity and preregistration.** Without `--prereg` every row is exploratory,
-  Benjamini–Hochberg adjusted (bootstrap two-sided p-values with add-one). With a prereg file
-  (`examples/prereg-example.json` — illustrative placeholders, not a preregistration) the declared
-  primary contrasts are Holm-adjusted as their own family and flagged `exceeds_mme` / `within_mme`
-  against the stated minimum meaningful effect; unmatched primary entries are reported loudly.
-  The report records the prereg file's SHA-256 and the number of exploratory tests (the full
-  design yields on the order of 10³ metric-level estimates).
-- **Planned test counts.** Unavailable p-values remain in the adjustment family as conservative
-  non-rejections; their reported p-values stay unavailable. Use `expected_tests` on each primary
-  entry to register how many rows its filters should select, including strata that might be
-  entirely missing. Fewer observed rows retain that planned family size; extra rows are an error.
-  Without an explicit count, matched rows count individually and an unmatched entry reserves at
-  least one test before analysis reports the missing entry as an error. The report separates
-  planned primary tests from tests with available p-values.
-- **Preregistration is separate from the hash-bound review workflow.** Review hashes protect the
-  *materials*; a statistical preregistration must additionally fix hypotheses, exclusions, stopping
-  rules and analysis decisions.
+Cross-language/persona/cue interactions require equal economics and material hashes. Shared hashes
+are integrity checks, not evidence of translation equivalence. Existing occasion/purchase/no-calendar
+contrasts are robustness comparisons, with wording, norm, length and economic-interpretation confounds.
 
----
+Opt-in `--inference scenario_sign_flip` requires a collection-bound externally attested plan, explicit
+independent sign symmetry, an approved original roster, immutable model/tokenizer identities, full
+valid evaluation data, and at least 12 independent scenarios **per tested stratum**. The test is exact
+through 16 scenarios, otherwise add-one Monte Carlo. Human/subgroup estimates stay descriptive. Fixed
+primary identities/counts use Holm; missing tests remain in the family. No population CI is claimed.
+The shipped four-scenario test split does not meet the threshold, and the threshold is not a power
+justification. See [the audit response and inferential contract](docs/AUDIT_RESPONSE.md).
 
-## Confirmatory workflow (materials)
+`examples/prereg-example.json` is a descriptive illustration, not proof of preregistration. A
+confirmatory plan needs an external HTTPS registration URL, prior timezone-aware `registered_at`,
+`timestamp_verified_by`, target population, frozen `evaluation_splits: ["test"]`, and
+`template_weighting: "equal_planned_templates_complete_case"`. Each primary entry must register
+one exact hypothesis (`expected_tests: 1`, all source/provider/design/split filters). Register the
+exact bytes before collection; the software records the attestation and cannot authenticate it.
 
 ```sh
-# set "mode": "confirmatory" in the config BEFORE exporting
-auspicious review-export --config data/full-config.json --out review/manifest.json
-# reviewers edit decision / reviewer / approved_at per scope
-# (design, calendar, and each language:<lang>:<template>); add "review_path" to the config
-auspicious build --config data/full-config.json --out runs/confirmatory.jsonl
-auspicious validate --trials runs/confirmatory.jsonl --confirmatory
-auspicious run --trials runs/confirmatory.jsonl --out runs/confirmatory-gemini \
-  --model gemini-2.5-flash --confirmatory --concurrency 8 --rpm 60
+python scripts/calibrate_inference.py --out calibration.json
 ```
 
-Review materials live **once per corpus** in `<trials>.review.json` (each trial carries only
-`context_sha256`). Confirmatory runs reject: draft status, a missing or tampered sidecar, content or
-approval hash mismatches, prompt edits, any subset of the reviewed design, and `--limit`. Approvals
-are attributable attestations, not cryptographic identity verification.
-Reusing a loaded review context rechecks its content hash, including nested material and approval
-changes; sharing the same Python object does not bypass integrity checks.
+This reproducible synthetic null/power check does not validate the authored corpus's assumptions.
 
----
+## Reviewed materials and prospective collection
 
-## Human comparison
-
-The human estimand is the same event − neutral effect on the same trials. Participants who see both
-halves of a near-identical pair can infer the purpose, so **no participant receives two trials from
-the same pair or the same scenario**:
+Export review scopes, obtain attributable independent review, then build and validate the entire
+reviewed design. `review-export` does not supply a review. No shipped materials have independent
+approval or verified calendar dates.
 
 ```sh
-auspicious assign-participants --trials runs/full.jsonl --out surveys/run1 \
-  --participants 240 --design between --items-per-participant 8 \
-  --filler-fraction 0.25 --language en --language hi --seed 7
-#   design `between`: each participant sees one arm (event or neutral) throughout
-#   design `counterbalanced`: conditions vary only across different scenarios
-# outputs: assignments.csv, surveys/<subject>.csv (prompts only, no condition metadata),
-#          design.json (balance statistics), participants-template.csv
+# Set mode=confirmatory BEFORE exporting; reviewers complete genuine approval records.
+auspicious review-export --config reviewed-config.json --out review/manifest.json
+auspicious build --config reviewed-config.json --out runs/reviewed.jsonl
+auspicious validate --trials runs/reviewed.jsonl --confirmatory
+# Explicit immutable local model/tokenizer and externally registered plan:
+auspicious run-openweights --trials runs/reviewed.jsonl --out runs/prospective \
+  --model "$PINNED_LOCAL_MODEL" --confirmatory --prereg registered-plan.json
 ```
 
-Fillers are `no_calendar` trials from scenarios not otherwise used by that participant (the corpus
-must include `no_calendar`). Then:
+The review sidecar is `<trials>.review.json`. Collection rejects draft materials, tampered review
+content, subsets of a reviewed design, limits, an incomplete prospective plan and unresolved model
+or tokenizer identity. Hosted models that do not expose immutable identities cannot support this
+confirmatory path. Each record binds the plan hash, source-file hashes, git revision and runtime
+versions before the response is collected. Changing code/runtime/protocol requires a fresh run
+directory; an old exploratory collection cannot become prospective retroactively.
+
+## Human studies
+
+Assignments are drafts until recruitment, language eligibility, comprehension, masking/suspicion,
+coverage and the analysis plan have been piloted and independently checked. Existing `no_calendar`
+fillers are financial tasks, not validated masking material.
 
 ```sh
-auspicious import-humans --trials runs/full.jsonl --csv responses.csv --out runs/humans.jsonl
-auspicious import-participants --csv participants.csv --out runs/participants.json
+auspicious assign-participants --trials runs/full.jsonl --out surveys/study1 \
+  --study-id study1 --participants 240 --design between --items-per-participant 8 \
+  --filler-fraction 0.25 --language en --language hi --seed 7 \
+  --participant-roster eligible.csv
+```
+
+The optional roster has `subject_id,language,language_eligible,session_id`; every subject must be
+eligible in the assigned language. Without it, language assignment is a drafting convenience and
+eligibility remains unverified. Between-participant arms use randomized permuted blocks within
+language rather than strict alternation. Conceal the master assignments and seed from recruiters.
+Counterbalanced participants encounter both framings across distinct scenarios, so demand effects
+remain possible. The preflight reports unexposed tasks and missing-arm coverage.
+
+Distribute only `surveys/<study-subject>.csv`. Preserve `design.json` and `assignments.csv` unchanged.
+Responses must carry `study_id,subject_id,trial_id,position` plus the answer columns in
+`examples/human-format.csv`; include actual `submitted_at` timestamps with timezone to check order.
+
+```sh
+auspicious import-humans --trials runs/full.jsonl --csv responses.csv \
+  --assignments surveys/study1/design.json --out runs/humans.jsonl
+auspicious import-participants --csv participants.csv --out runs/participants.json \
+  --assignments surveys/study1/design.json --instrument instrument.json
 auspicious analyze --records runs/full-gemini/records.jsonl --humans runs/humans.jsonl \
-  --participants runs/participants.json --human-design auto --out runs/compare
+  --trials runs/full.jsonl --assignments surveys/study1/design.json \
+  --participants runs/participants.json --out runs/compare
 ```
 
-`--human-design auto` picks `unpaired` (between-subject/counterbalanced; per pair, event responders
-minus neutral responders, subjects and scenarios both resampled) or `within` (a subject answered
-both conditions), and refuses to guess on mixed data. Participant covariates — `survey_language`,
-`language_proficiency` (1–5), `financial_literacy` (your instrument's numeric score),
-`observance_self_report` (1–5) — are measured, never assumed from the assigned persona, and are
-used for descriptive heterogeneity only. Invalid answers stay invalid; nothing is imputed.
-`examples/human-format.csv` and `examples/participants-format.csv` are header-only. Even a clean
-comparison concerns these hypothetical tasks, not real investing; get ethics approval and
-document recruitment before collecting data.
+Instrument JSON documents `id,version,source,scoring`; documentation is not validation. Covariates
+are measured separately, never inferred from an assigned persona. Subject/language/task/position,
+study and file hashes are verified. The report shows assigned ? submitted ? valid ? analysed,
+nonresponse, order diagnostics and assignment-based outcome-support bounds. Tasks with no assigned
+participant in one arm are flagged. Human effects, model-minus-human effects and subgroup mixtures
+are descriptive; they do not receive population intervals or adjusted significance. Legacy import
+requires explicit `--allow-unassigned`, with unknown nonresponse denominators.
 
-The unpaired model-human comparison reports participant-population intervals only when every
-observed arm-membership stratum has at least two independent participants and there are at least
-two scenarios. A singleton stratum leaves the point estimate available but returns no interval,
-with `ci_unavailable_reason=requires_two_subjects_per_arm_stratum`. This is a minimum eligibility
-check, not a claim that two participants provide adequate power.
+External series imported with `auspicious context` remain descriptive and are never pooled with
+allocations. The repository contains no participant or market observations.
 
-Contextual market series (`auspicious context --csv …`, columns `date,series,value,unit,source,event`)
-remain descriptive and are never pooled with allocations.
-
----
-
-## Open-weight probing and steering
-
-Establish the **behavioral** result with the controls above first; only then ask about
-representations.
+## Open-weight condition probes and steering
 
 ```sh
 auspicious select --trials runs/full.jsonl --festival dhanteras --festival akshaya_tritiya \
-  --cue festival_named --out runs/aus.jsonl                # single event valence required
-auspicious extract --trials runs/aus.jsonl --out runs/act.npz --model $MODEL --layer 16
+  --cue festival_named --out runs/aus.jsonl
+auspicious extract --trials runs/aus.jsonl --out runs/act.npz --model "$MODEL" --layer 16
 auspicious probe --activations runs/act.npz --out runs/probe.npz
 ```
 
-The probe predicts event vs neutral (calendar salience; **not** "auspiciousness" — a separate probe
-is needed for avoidance valence). Its report includes controls meant to stop probe accuracy from
-being over-read:
-
-- `text_baseline` — hashed character n-gram ridge classifier on the same cluster splits, and
-  `probe_vs_text_baseline`. A probe that does not beat the text baseline does not support a
-  representation claim.
-- `transfer` — leave-one-value-out over festival, language, template and paraphrase (train-split
-  clusters of other values; scored on test-split clusters of the held-out value). The language
-  holdout is cross-language transfer.
-- `random_direction_null` — accuracy of 200 norm-matched random directions (diagnostic, not a
-  calibrated test).
-
-Steering and its checks:
+The label is explicitly encoded in prompt text: accuracy means **condition decodability**, not
+belief or a general auspiciousness representation. A text classifier can hit a 100% ceiling; beating
+it is not a necessary or sufficient representation test. Text ridge is selected independently on
+dev, with no test tuning. Reports include train-scenario refits, evaluation-scenario leave-one-out
+ranges, cross-festival/language/template/paraphrase/cue transfer and a random-direction diagnostic.
+Lexically disjoint independently authored cues and polarity counterfactuals are still required.
+Stored trial-content and prompt hashes are rechecked on artifact load.
 
 ```sh
-# one steered run (positive strength -> toward event); positions: all | prompt_last | generated
-auspicious run-openweights --trials runs/aus.jsonl --out runs/steer --model $MODEL \
-  --steering-path runs/probe.npz --strength -2 --steering-positions generated
-# arithmetic/financial capability, with the same steering settings
-auspicious capability --out runs/cap.json --model $MODEL --steering-path runs/probe.npz --strength -2
-# layer x position x strength grid, random-direction controls, test-split trials only
-auspicious steering-grid --trials runs/aus.jsonl --out runs/grid --model $MODEL \
-  --layers 8 12 16 --strengths -4 -2 2 4 --positions all prompt_last generated \
-  --random-seeds 1 2 3 4 5
+# Choose intervention behavior on dev; test scores are omitted from these probe reports.
+auspicious steering-grid --trials runs/aus.jsonl --out runs/dev-grid --model "$MODEL" \
+  --layers 8 12 16 --strengths -2 2 --positions all prompt_last generated --random-seeds 1 2 3
+# Freeze one chosen completed dev cell, before inspecting test behavior.
+auspicious freeze-steering --grid runs/dev-grid/grid.json --layer 12 --position prompt_last \
+  --strength 2 --out runs/selection.json
+# Exactly that setting, same corpus/model/generation/control settings, full test pairs.
+auspicious steering-grid --trials runs/aus.jsonl --out runs/test-evaluation --model "$MODEL" \
+  --layers 12 --strengths 2 --positions prompt_last --random-seeds 1 2 3 \
+  --evaluation-split test --frozen-selection runs/selection.json
 ```
 
-(Use space-separated lists; `--strengths -4 -2` is valid.) The grid fits each probe on train-split
-clusters and evaluates steering on **test**-split pairs only, with a zero-strength baseline per
-layer, norm-matched random directions, and a capability check per cell. Compare behavior against
-baseline, random directions, validity rate, and capability; the analysis step keeps steered runs in
-separate strata (steering settings are part of the generation identity). `data/capability.json` is
-draft, AI-authored arithmetic items.
-Resumed capability checks reuse scores only when the currently validated item-file content hash,
-item path, item limit, and provider identity all match. Editing or switching the questions refreshes
-the capability report while completed investment trials remain resumable.
+The local freeze binds dev artifacts, source/runtime, corpus and generation settings. It is an
+integrity aid, not proof that nobody has inspected/reused test data; externally register it for
+stronger claims. Reusing the same test data after selecting another cell remains exploratory.
 
-A steering vector that moves outputs shows a causally effective direction in the tested setting. It
-does **not** show that the direction mediates the original date effect or is specific to
-auspiciousness; that needs activation patching or ablation plus the controls above.
+Grid/CLI dose defaults to unit norm in diagonal-standardized **train** activation coordinates.
+Strength is the size of that displacement; random directions match it. This is not full covariance
+whitening or equal downstream disruption. Direct provider calls retain legacy raw-coefficient dose
+for compatibility; CLI users must explicitly choose `--steering-dose raw_coefficient` for that mode.
 
----
+Random controls and capability checks default on; `controls_complete` is separate from computation
+`complete`. An uncontrolled grid can be explored but cannot be frozen for test evaluation. Each
+cell reports paired validity/behavior changes versus baseline; random cells also compare against
+learned cells, with paired answer/correctness transitions on capability items. The draft capability
+set contains **15 unique authored problems**, repeated in five languages, not 75 independent items.
+Cache reuse requires unchanged source/runtime, materials, item limit and provider settings.
 
-## Commands
+An effective intervention direction does not establish mediation of the original calendar effect,
+general reasoning preservation, or specificity to auspiciousness.
 
-| Command | Purpose |
-|---|---|
-| `build` / `review-export` / `validate` / `select` | Corpus construction, review, integrity, whole-pair subsets |
-| `models` / `run` / `run-openweights` | Gemini and local execution (resumable journals) |
-| `analyze` | Contrasts, interactions, validity, bounds, multiplicity, human comparison |
-| `assign-participants` / `import-humans` / `import-participants` | Human design, responses, covariates |
-| `context` | Descriptive external series |
-| `extract` / `probe` / `capability` / `steering-grid` | Representation and steering |
+## Limits and audit follow-up
 
-`auspicious <command> --help` lists options. Credentials come from `GEMINI_API_KEY`,
-`GOOGLE_API_KEY`, or `GEMINI_API_KEYS` (JSON array); they are never written to records, logs, or
-manifests.
+The target situation population, independent scenario authorship, bilingual validation, matched
+control families, validated dates, additional avoidance occasions, human pilot and expanded
+capability set remain research work. More crossed prompts cannot supply independent scenarios.
+Recommendation sensitivity, compliance and hypothetical valuation are separate outcomes; no
+belief/irrationality composite is defined. Uncoded rationales do not establish reasoning mechanisms.
 
----
-
-## Limits
-
-- **Construct validity:** a cue effect is not a belief. Use the controls and decomposition;
-  report which explanations remain open.
-- **Language:** wording, register and fluency are confounded with language. Independent bilingual
-  review and independently authored templates are required; `t2` is an AI-drafted variant.
-- **Sample size:** 12 scenarios from one author set. Intervals describe the sampled scenarios; the
-  design warns when fewer than 8 are present. Prefer more scenarios and independent prompt authors
-  to more repetitions.
-- **Outcomes:** gold allocation has no uniquely correct value when risk tolerance is unspecified;
-  `wtp_premium_pct` benchmarks against the quoted unit price only. Reserve violation uses the
-  prompt's cash-only definition.
-- **Missingness:** complete-case effects, validity effects and bounds answer different questions;
-  report all three.
-- **Probing/steering:** see above; the single label-flip control stored in the probe report and the
-  random-direction null are diagnostics.
-- **Humans:** hypothetical tasks; recruitment, assignment and ethics approval are your
-  responsibility.
-- **Statistics:** intervals are unadjusted percentile bootstrap; multiplicity adjustment applies to
-  the bootstrap p-values only. Preregister primary contrasts and minimum effects before collection.
+[Audit response](docs/AUDIT_RESPONSE.md) tracks all 18 supplied findings, implemented safeguards,
+remaining empirical work, compatibility changes and reproducible calibration evidence.

@@ -75,12 +75,12 @@ def read_jsonl(path):
     return rows
 
 
-def atomic_text(path, text):
+def atomic_text(path, text, *, newline=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
@@ -234,7 +234,9 @@ def _select_trials(trials, limit):
 
 
 def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurrency=2,
-               limit=None, retry_errors=False):
+               limit=None, retry_errors=False, prereg_path=None):
+    from .protocol import collection_protocol, immutable_provider, runtime_identity
+    protocol = collection_protocol(prereg_path, confirmatory=confirmatory)
     trials = read_jsonl(trials_path)
     validate_trials(trials, confirmatory=confirmatory,
                     review_context=load_review_context(trials_path, confirmatory))
@@ -245,9 +247,13 @@ def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurr
     selected = _select_trials(trials, limit)
     if hasattr(provider, "prepare"):
         provider.prepare()
-    identity = provider.identity
+    identity = strict_json(canonical(provider.identity))
+    environment = runtime_identity()
+    if confirmatory and not immutable_provider(identity):
+        raise ValueError("Confirmatory runs require immutable resolved model and tokenizer identities")
     fingerprint = digest({"trials": sorted(trials, key=lambda t: t["trial_id"]),
-                          "provider": identity, "confirmatory": confirmatory})
+                          "provider": identity, "confirmatory": confirmatory, "runtime": environment,
+                          "protocol_sha256": protocol["sha256"] if protocol else None})
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
     with open(directory / ".lock", "a") as lock:
@@ -265,6 +271,7 @@ def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurr
             if not previous:
                 connection.execute("INSERT INTO metadata VALUES ('fingerprint', ?)", (fingerprint,))
                 manifest = {"schema_version": 1, "fingerprint": fingerprint, "provider": identity,
+                            "runtime": environment, "protocol_sha256": protocol["sha256"] if protocol else None,
                             "confirmatory": confirmatory, "trial_count": len(trials),
                             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                             "design_sha256": digest(sorted(trials, key=lambda t: t["trial_id"])),
@@ -274,6 +281,8 @@ def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurr
                 connection.commit()
             manifest = strict_json(connection.execute("SELECT value FROM metadata WHERE key='manifest'").fetchone()[0])
             atomic_text(directory / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+            if protocol is not None:
+                atomic_text(directory / "preregistration.json", protocol["text"], newline="")
             completed = dict(connection.execute("SELECT trial_id,status FROM results"))
             pending = [t for t in selected if t["trial_id"] not in completed or
                        (retry_errors and completed[t["trial_id"]] == "error")]
@@ -295,7 +304,11 @@ def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurr
                 result.setdefault("usage", {})
                 result.setdefault("attempts", 1)
                 result.update(started_at=timestamp, elapsed_seconds=time.monotonic() - started)
-                return {"trial": trial, "result": result}
+                return {"trial": trial, "result": result,
+                        "collection": {"fingerprint": fingerprint, "runtime": environment,
+                                       "provider_identity": identity, "confirmatory": confirmatory,
+                                       "protocol_sha256": protocol["sha256"] if protocol else None,
+                                       "immutable_provider_verified": immutable_provider(identity)}}
 
             executed = 0
             try:

@@ -22,6 +22,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import zlib
@@ -31,7 +32,7 @@ _FORMAT = 1
 _REPRESENTATION = "decoder_block_output_prompt_final_token"
 _STEERING_POSITIONS = ("all", "prompt_last", "generated")
 _PROBE_CONDITIONS = ("event", "neutral")
-_TRANSFER_FIELDS = ("festival", "language", "template_id", "paraphrase_id")
+_TRANSFER_FIELDS = ("festival", "language", "template_id", "paraphrase_id", "cue")
 _TEXT_DIM = 2 ** 14
 _TEXT_NGRAMS = (3, 4, 5)
 _NULL_DIRECTIONS = 200
@@ -125,10 +126,13 @@ def _local_model_digest(model):
     return digest.hexdigest()
 
 
-def _provenance(network, model, revision, layer, *, local_model_sha256=None):
+def _provenance(network, model, revision, layer, *, local_model_sha256=None, tokenizer=None):
+    from .protocol import runtime_identity
     return {
         "format_version": _FORMAT, "model": model, "revision": revision,
         "resolved_revision": getattr(network.config, "_commit_hash", None),
+        "tokenizer_resolved_revision": getattr(tokenizer, "init_kwargs", {}).get("_commit_hash"),
+        "runtime": runtime_identity(),
         "local_model_sha256": local_model_sha256 if local_model_sha256 is not None else _local_model_digest(model),
         "layer": layer, "width": _width(network), "representation": _REPRESENTATION,
         "prompt_format": "tokenizer_chat_template_if_available_else_plain",
@@ -200,27 +204,38 @@ class _ResidualSteering:
         return (shifted,) + output[1:] if isinstance(output, tuple) else shifted
 
 
-def _read_steering(path, provenance, random_direction_seed=None):
+def _read_steering(path, provenance, random_direction_seed=None, *, dose="raw_coefficient"):
     np = _numpy()
     try:
         with np.load(path, allow_pickle=False) as data:
             metadata = json.loads(str(data["metadata"].item()))
             direction = np.asarray(data["direction"], dtype=np.float64).copy()
+            scale = np.asarray(data["scaler_scale"], dtype=np.float64) if dose == "activation_std" else None
     except (OSError, KeyError, ValueError, TypeError) as exc:
         raise ValueError(f"Invalid steering artifact: {exc}") from exc
     if not isinstance(metadata, dict) or metadata.get("kind") != "ridge_condition_probe":
         raise ValueError("Steering requires a ridge_condition_probe artifact.")
-    for key in ("format_version", "model", "revision", "resolved_revision", "local_model_sha256", "layer", "width", "representation", "prompt_format"):
+    for key in ("format_version", "model", "revision", "resolved_revision", "tokenizer_resolved_revision", "local_model_sha256", "layer", "width", "representation", "prompt_format"):
         if metadata.get(key) != provenance.get(key):
             raise ValueError(f"Steering provenance mismatch for {key}: {metadata.get(key)!r} != {provenance.get(key)!r}.")
     if direction.shape != (provenance["width"],) or not np.isfinite(direction).all():
         raise ValueError("Steering direction has invalid width or nonfinite values.")
+    if dose not in ("raw_coefficient", "activation_std"):
+        raise ValueError("Unknown steering dose calibration")
+    if dose == "activation_std":
+        if scale.shape != direction.shape or not np.isfinite(scale).all() or (scale <= 0).any():
+            raise ValueError("Calibrated steering requires finite positive train activation scales")
+        # A unit displacement in diagonal-standardized training activation space.
+        # This is not a full covariance/Mahalanobis or downstream-disruption match.
+        direction = direction * scale
     norm = float(np.linalg.norm(direction))
     if not math.isfinite(norm) or norm == 0:
         raise ValueError("Steering direction must have a finite nonzero norm.")
     if random_direction_seed is not None:
         random = np.random.default_rng(random_direction_seed).normal(size=direction.shape)
         direction = random * (norm / np.linalg.norm(random))
+    if dose == "activation_std":
+        direction = direction / norm * scale
     return direction
 
 
@@ -239,7 +254,7 @@ class OpenWeightProvider:
     def __init__(self, model, revision=None, device="cpu", temperature=0.0,
                  max_output_tokens=512, seed=42, steering_path=None, strength=0.0,
                  layer=None, *, random_direction_seed=None, steering_positions="all",
-                 _shared=None):
+                 steering_dose="raw_coefficient", _shared=None):
         if not isinstance(model, str) or not model.strip():
             raise ValueError("An explicit model name or local model directory is required.")
         if not math.isfinite(temperature) or temperature < 0:
@@ -261,6 +276,9 @@ class OpenWeightProvider:
         self.steering_path, self.strength, self.layer = steering_path, strength, layer
         self.random_direction_seed = random_direction_seed
         self.steering_positions = steering_positions
+        if steering_dose not in ("raw_coefficient", "activation_std"):
+            raise ValueError("Unknown steering dose calibration")
+        self.steering_dose = steering_dose
         # _shared lets steering_grid reuse one loaded model and one local-file digest.
         self._preloaded = _shared["runtime"] if _shared else None
         self._runtime = None
@@ -279,6 +297,7 @@ class OpenWeightProvider:
                            "seed": seed, "strength": strength, "layer": layer,
                            "random_direction_seed": random_direction_seed,
                            "steering_sha256": digest,
+                           "steering_dose": steering_dose,
                            "steering_positions": steering_positions},
         }
 
@@ -301,9 +320,9 @@ class OpenWeightProvider:
                     raise ValueError(f"Invalid steering artifact: {exc}") from exc
         selected = _layer_index(-1 if selected is None else selected, len(layers))
         provenance = _provenance(network, self.model_name, self.revision, selected,
-                                 local_model_sha256=self._local_model_sha256)
+                                 local_model_sha256=self._local_model_sha256, tokenizer=tokenizer)
         if self.steering_path:
-            direction = _read_steering(self.steering_path, provenance, self.random_direction_seed)
+            direction = _read_steering(self.steering_path, provenance, self.random_direction_seed, dose=self.steering_dose)
             self._direction = torch.as_tensor(
                 direction, device=self.device, dtype=next(network.parameters()).dtype
             )
@@ -316,6 +335,7 @@ class OpenWeightProvider:
             self._ensure_loaded()
             network = self._runtime[2]
             self.identity["resolved_revision"] = getattr(network.config, "_commit_hash", None)
+            self.identity["tokenizer_resolved_revision"] = getattr(self._runtime[1], "init_kwargs", {}).get("_commit_hash")
             self.identity["generation"]["resolved_layer"] = self._selected_layer
 
     def _seed_for(self, key):
@@ -469,7 +489,7 @@ def extract_activations(trials_path, output_path, *, model, revision=None, layer
     torch, tokenizer, network = _load_runtime(model, revision, device)
     layers = _decoder_layers(network)
     selected = _layer_index(layer, len(layers))
-    provenance = _provenance(network, model, revision, selected)
+    provenance = _provenance(network, model, revision, selected, tokenizer=tokenizer)
     features = _capture_activations(torch, tokenizer, network, device, trials, [selected],
                                     provenance["width"])[selected]
     metadata = _save_activations(output_path, trials, features, provenance, len(all_trials) - len(trials))
@@ -497,9 +517,14 @@ def _decision_scores(np, decision, labels, clusters):
     correct = predicted == labels
     cluster_accuracy = [float(correct[clusters == key].mean()) for key in np.unique(clusters)]
     balanced = [float(correct[labels == value].mean()) for value in (0, 1) if (labels == value).any()]
+    loo = [float(np.mean(cluster_accuracy[:i] + cluster_accuracy[i + 1:]))
+           for i in range(len(cluster_accuracy))] if len(cluster_accuracy) > 1 else []
     return {"n": int(len(labels)), "n_clusters": int(len(cluster_accuracy)),
             "accuracy": float(correct.mean()), "balanced_accuracy": float(np.mean(balanced)),
-            "cluster_macro_accuracy": float(np.mean(cluster_accuracy))}
+            "cluster_macro_accuracy": float(np.mean(cluster_accuracy)),
+            "per_cluster_accuracy": {str(key): float(correct[clusters == key].mean()) for key in np.unique(clusters)},
+            "leave_one_cluster_out_macro_range": [min(loo), max(loo)] if loo else None,
+            "uncertainty_note": "Descriptive scenario sensitivity; no population confidence interval."}
 
 
 def _scores(np, x, labels, clusters, coefficient, intercept):
@@ -568,12 +593,25 @@ def _kernel_decision(np, kernel, inverse, train, evaluate, labels, ridge):
     return cross @ alpha + mean_y
 
 
-def _text_baseline(np, trials, labels, clusters, splits, ridge, text):
+def _tune_text_ridge(np, text, labels, clusters, train, dev):
+    candidates = (0.01, 0.1, 1.0, 10.0, 100.0)
+    if not len(dev) or len(np.unique(labels[dev])) != 2:
+        return 1.0, {"status": "fixed_fallback_no_eligible_dev", "candidates": list(candidates)}
+    scores = {value: _decision_scores(np, _kernel_decision(np, *text, train, dev, labels, value),
+                                     labels[dev], clusters[dev])["cluster_macro_accuracy"] for value in candidates}
+    chosen = max(candidates, key=lambda value: (scores[value], -value))
+    return chosen, {"status": "dev_cluster_macro_accuracy", "scores": scores, "tie_break": "smallest ridge"}
+
+
+def _text_baseline(np, trials, labels, clusters, splits, ridge, text, evaluation_split="test"):
     kernel, inverse = text
     train = np.flatnonzero(splits == "train")
+    ridge, selection = _tune_text_ridge(np, text, labels, clusters, train, np.flatnonzero(splits == "dev"))
     majority = int(labels[train].mean() >= 0.5)
     reports = {}
     for name in ("train", "dev", "test"):
+        if name == "test" and evaluation_split != "test":
+            continue
         rows = np.flatnonzero(splits == name)
         decision = _kernel_decision(np, kernel, inverse, train, rows, labels, ridge)
         reports[name] = _decision_scores(np, decision, labels[rows], clusters[rows])
@@ -581,7 +619,8 @@ def _text_baseline(np, trials, labels, clusters, splits, ridge, text):
     return {
         "features": f"signed hashed log-count character {_TEXT_NGRAMS[0]}-{_TEXT_NGRAMS[-1]}-grams, "
                     f"dim {_TEXT_DIM}, L2-normalized rows; trial prompt text only",
-        "ridge": float(ridge), "ridge_note": "same ridge value as the probe, applied to unit-norm rows (no tuning)",
+        "ridge": float(ridge), "ridge_note": "text penalty tuned independently of activation penalty on dev only",
+        "selection": selection,
         "splits": reports,
     }
 
@@ -596,6 +635,8 @@ def _validated_trials(np, text, ids, labels, clusters, splits):
     for row, trial in enumerate(trials):
         if not isinstance(trial, dict) or not isinstance(trial.get("prompt"), str):
             raise ValueError("Stored trials must be trial objects with prompts.")
+        if trial.get("prompt_sha256") != hashlib.sha256(trial["prompt"].encode()).hexdigest():
+            raise ValueError("Stored trial prompt hash mismatch")
         if (trial.get("trial_id") != str(ids[row]) or trial.get("cluster_id") != str(clusters[row])
                 or trial.get("split") != str(splits[row])
                 or int(trial.get("condition") == "event") != int(labels[row])):
@@ -609,7 +650,7 @@ def _macro(rows, key):
     return float(sum(row[key] for row in rows) / len(rows))
 
 
-def _transfer(np, x, labels, clusters, splits, trials, ridge, text):
+def _transfer(np, x, labels, clusters, splits, trials, ridge, text, evaluation_split="test"):
     kernel, inverse = text
     report = {
         "design": "leave-one-value-out: probe and text baseline are fit on train-split clusters "
@@ -628,7 +669,7 @@ def _transfer(np, x, labels, clusters, splits, trials, ridge, text):
         held_out, evaluated = {}, []
         for value in distinct:
             train = np.flatnonzero((splits == "train") & (values != value))
-            test = np.flatnonzero((splits == "test") & (values == value))
+            test = np.flatnonzero((splits == evaluation_split) & (values == value))
             if not len(test) or len(np.unique(labels[test])) != 2:
                 held_out[value] = {"skipped": "held-out test split lacks both event and neutral trials"}
                 continue
@@ -638,12 +679,16 @@ def _transfer(np, x, labels, clusters, splits, trials, ridge, text):
             mean, scale, coefficient, intercept = _standardized_ridge(np, x, labels, train, ridge)
             probe = _decision_scores(np, ((x[test] - mean) / scale) @ coefficient + intercept,
                                      labels[test], clusters[test])
+            text_ridge, _selection = _tune_text_ridge(np, text, labels, clusters, train,
+                                                     np.flatnonzero((splits == "dev") & (values != value)))
             baseline = _decision_scores(
-                np, _kernel_decision(np, kernel, inverse, train, test, labels, ridge),
+                np, _kernel_decision(np, kernel, inverse, train, test, labels, text_ridge),
                 labels[test], clusters[test])
             row = {"n": probe["n"], "n_clusters": probe["n_clusters"], "n_train": int(len(train)),
                    "accuracy": probe["accuracy"], "balanced_accuracy": probe["balanced_accuracy"],
                    "cluster_macro_accuracy": probe["cluster_macro_accuracy"],
+                   "leave_one_cluster_out_macro_range": probe["leave_one_cluster_out_macro_range"],
+                   "text_ridge": text_ridge,
                    "text_baseline_accuracy": baseline["accuracy"],
                    "text_baseline_balanced_accuracy": baseline["balanced_accuracy"],
                    "text_baseline_cluster_macro_accuracy": baseline["cluster_macro_accuracy"]}
@@ -659,12 +704,15 @@ def _transfer(np, x, labels, clusters, splits, trials, ridge, text):
         report[field] = entry
     if "language" in report:
         report["language"]["note"] = "cross-language transfer"
+    report["evaluation_split"] = evaluation_split
+    report["design"] = "Train on other values; evaluate held-out values on " + evaluation_split + "; descriptive condition decodability. Text ridge selected on other-value dev clusters."
+    report["limitations"] = "Cross-cue transfer does not certify lexical disjointness or polarity counterfactual validation."
     return report
 
 
-def _random_null(np, standardized, labels, clusters, splits, coefficient, probe_accuracy):
+def _random_null(np, standardized, labels, clusters, splits, coefficient, probe_accuracy, evaluation_split="test"):
     """Accuracy of norm-matched random directions; a diagnostic, not a calibrated test."""
-    train, test = splits == "train", splits == "test"
+    train, test = splits == "train", splits == evaluation_split
     rng = np.random.default_rng(_NULL_SEED)
     directions = rng.normal(size=(_NULL_DIRECTIONS, standardized.shape[1]))
     directions *= float(np.linalg.norm(coefficient)) / np.linalg.norm(directions, axis=1, keepdims=True)
@@ -674,7 +722,7 @@ def _random_null(np, standardized, labels, clusters, splits, coefficient, probe_
     decision = standardized[test] @ directions.T + intercept
     accuracy = ((decision >= 0) == labels[test][:, None].astype(bool)).mean(axis=0)
     return {
-        "n_directions": _NULL_DIRECTIONS, "seed": _NULL_SEED, "split": "test",
+        "n_directions": _NULL_DIRECTIONS, "seed": _NULL_SEED, "split": evaluation_split,
         "intercept": "fit on train only (mean +/-1 training target)",
         "accuracy_mean": float(accuracy.mean()),
         "accuracy_p5": float(np.percentile(accuracy, 5)),
@@ -686,26 +734,40 @@ def _random_null(np, standardized, labels, clusters, splits, coefficient, probe_
     }
 
 
-def _probe_vs_text(probe_report, text_report):
+def _probe_vs_text(probe_report, text_report, evaluation_split="test"):
     probe, text = probe_report["accuracy"], text_report["accuracy"]
     difference = float(probe - text)
-    if difference <= 0:
-        interpretation = (
-            "The activation probe does not exceed the character n-gram text baseline on the test split; "
-            "this does not support a claim that the activations represent more than prompt wording.")
-    else:
-        interpretation = (
-            f"The activation probe exceeds the text baseline by {difference:.3f} test accuracy on this "
-            "split. That alone does not establish a representation claim: also require held-out "
-            "festival/language/template transfer above the text baseline and above the random-direction null.")
-    return {"probe_test_accuracy": float(probe), "text_baseline_test_accuracy": float(text),
-            "difference": difference, "same_splits": True, "interpretation": interpretation}
+    interpretation = ("Both scores describe condition decodability. The condition is explicit in the prompt; "
+                      "a ceiling text score cannot be exceeded. Neither the difference nor random directions "
+                      "establish information beyond wording, a general auspiciousness concept, or mediation.")
+    result = {"probe_accuracy": float(probe), "text_baseline_accuracy": float(text),
+              "evaluation_split": evaluation_split, "difference": difference,
+              "same_splits": True, "interpretation": interpretation}
+    if evaluation_split == "test":
+        result.update(probe_test_accuracy=float(probe), text_baseline_test_accuracy=float(text))
+    return result
 
 
-def fit_probe(activations_path, output_path, *, ridge=1.0):
+def _training_cluster_sensitivity(np, x, labels, clusters, splits, ridge, evaluation_split):
+    rows = []
+    evaluate = splits == evaluation_split
+    for cluster in np.unique(clusters[splits == "train"]):
+        train = np.flatnonzero((splits == "train") & (clusters != cluster))
+        if not len(train) or len(np.unique(labels[train])) < 2:
+            rows.append({"omitted_cluster": str(cluster), "skipped": "remaining train lacks both classes"})
+            continue
+        mean, scale, coef, intercept = _standardized_ridge(np, x, labels, train, ridge)
+        row = _scores(np, (x[evaluate] - mean) / scale, labels[evaluate], clusters[evaluate], coef, intercept)
+        rows.append({"omitted_cluster": str(cluster), **row})
+    return {"evaluation_split": evaluation_split, "refits": rows,
+            "interpretation": "Descriptive leave-one-train-scenario-out stability; no population uncertainty guarantee."}
+
+
+def fit_probe(activations_path, output_path, *, ridge=1.0, evaluation_split="test"):
     """Fit event-vs-neutral ridge classifier with strictly train-only scaling.
 
-    Dev/test are reported without tuning. A fixed-seed cluster-level label flip
+    Activation ridge is fixed; the text comparator selects its penalty on dev.
+    Test scores are omitted during dev selection. A fixed-seed cluster-level label flip
     and training-majority classifier are negative/baseline controls, not a
     calibrated permutation significance test. The report also contains a
     character n-gram text baseline on the same cluster splits (``text_baseline``,
@@ -715,6 +777,8 @@ def fit_probe(activations_path, output_path, *, ridge=1.0):
     Decodability does not establish mediation of financial decisions.
     """
     np = _numpy()
+    if evaluation_split not in ("dev", "test"):
+        raise ValueError("Probe evaluation_split must be dev or test")
     if isinstance(ridge, bool) or not math.isfinite(ridge) or ridge <= 0:
         raise ValueError("ridge must be finite and strictly positive.")
     try:
@@ -756,6 +820,8 @@ def fit_probe(activations_path, output_path, *, ridge=1.0):
         if not mask.any() or len(np.unique(labels[mask])) != 2:
             raise ValueError(f"Split {name!r} must contain both event and neutral observations.")
     trials = _validated_trials(np, trials_text, ids, labels, clusters, splits)
+    if metadata.get("trials_sha256") != _trials_digest(trials):
+        raise ValueError("Embedded trial-content digest mismatch")
     train = masks["train"]
     mean, scale = x[train].mean(axis=0), x[train].std(axis=0)
     scale[scale == 0] = 1.0
@@ -776,6 +842,8 @@ def fit_probe(activations_path, output_path, *, ridge=1.0):
     majority = int(labels[train].mean() >= 0.5)
     reports = {}
     for name, mask in masks.items():
+        if name == "test" and evaluation_split != "test":
+            continue
         reports[name] = _scores(np, standardized[mask], labels[mask], clusters[mask], coefficient, intercept)
         reports[name]["majority_baseline_accuracy"] = float((labels[mask] == majority).mean())
         reports[name]["cluster_label_flip_control"] = _scores(
@@ -786,9 +854,9 @@ def fit_probe(activations_path, output_path, *, ridge=1.0):
     if not np.isfinite(direction).all() or not math.isfinite(raw_intercept):
         raise ValueError("Probe fit produced nonfinite coefficients.")
     text = _text_kernel(np, [trial["prompt"] for trial in trials])
-    text_report = _text_baseline(np, trials, labels, clusters, splits, ridge, text)
+    text_report = _text_baseline(np, trials, labels, clusters, splits, ridge, text, evaluation_split)
     summary = {
-        "ridge": float(ridge), "splits": reports, "control_seed": 42,
+        "ridge": float(ridge), "splits": reports, "control_seed": 42, "evaluation_split": evaluation_split,
         "event_valence": valences[0], "label": "calendar salience:event=1,neutral=0",
         "control_flipped_train_clusters": flipped, "train_only_scaling": True,
         "direction_l2_norm": float(np.linalg.norm(direction)),
@@ -798,13 +866,14 @@ def fit_probe(activations_path, output_path, *, ridge=1.0):
         "steering_positions_note": "Positions are chosen on the provider (all, prompt_last, generated); the probe is learned at the final prompt token only.",
         "selection": "fixed ridge; no dev/test tuning",
         "text_baseline": text_report,
-        "probe_vs_text_baseline": _probe_vs_text(reports["test"], text_report["splits"]["test"]),
-        "transfer": _transfer(np, x, labels, clusters, splits, trials, ridge, text),
+        "probe_vs_text_baseline": _probe_vs_text(reports[evaluation_split], text_report["splits"][evaluation_split], evaluation_split),
+        "training_cluster_sensitivity": _training_cluster_sensitivity(np, x, labels, clusters, splits, ridge, evaluation_split),
+        "transfer": _transfer(np, x, labels, clusters, splits, trials, ridge, text, evaluation_split),
         "random_direction_null": _random_null(np, standardized, labels, clusters, splits, coefficient,
-                                              reports["test"]["accuracy"]),
+                                              reports[evaluation_split]["accuracy"], evaluation_split),
     }
     provenance = {key: metadata.get(key) for key in (
-        "format_version", "model", "revision", "resolved_revision", "local_model_sha256", "layer", "width",
+        "format_version", "model", "revision", "resolved_revision", "tokenizer_resolved_revision", "local_model_sha256", "layer", "width", "runtime",
         "representation", "prompt_format", "trust_remote_code"
     )}
     artifact_metadata = dict(provenance, kind="ridge_condition_probe", report=summary,
@@ -906,6 +975,7 @@ def capability_check(output_path, provider, *, items_path=None, limit=None):
     nothing about calendar sensitivity.
     """
     from .core import atomic_text
+    from .protocol import runtime_identity
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise ValueError("limit must be a positive integer.")
     data, items_sha256, resolved_path = _load_capability(items_path)
@@ -938,13 +1008,14 @@ def capability_check(output_path, provider, *, items_path=None, limit=None):
     report = {
         "schema_version": 1, "kind": "capability_check",
         "items_status": data["status"], "items_path": resolved_path, "items_sha256": items_sha256,
-        "n_items_per_language": len(items), "limit": limit,
+        "n_items_per_language": len(items), "n_independent_authored_items": len(items), "limit": limit,
         "tolerance": "correct if |answer-gold| <= 0.01 or <= 0.1% of |gold|; strict JSON {\"answer\": number}",
         "provider_identity": json.loads(json.dumps(provider.identity)),
+        "runtime": runtime_identity(),
         "overall": {"n": len(records), "accuracy": sum(r["correct"] for r in records) / len(records),
                     "invalid_rate": sum(not r["valid"] for r in records) / len(records)},
         "per_language": per_language, "records": records,
-        "interpretation": "General arithmetic competence under the stated intervention; DRAFT items, not a benchmark.",
+        "interpretation": "Performance on these draft arithmetic items. Translations are repeated measurements of the same items; no general reasoning or specificity claim.",
     }
     atomic_text(output_path, json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
     return dict(report, output=str(output_path))
@@ -998,34 +1069,99 @@ def _read_json_file(path):
 def _capability_report(output_path, provider, *, items_path=None, limit=None):
     """Reuse scores only for unchanged, currently valid capability materials and settings."""
     _data, items_sha256, resolved_path = _load_capability(items_path)
+    from .protocol import runtime_identity
     current = _read_json_file(output_path)
     expected_identity = json.loads(json.dumps(provider.identity))
     if (current is not None and current.get("kind") == "capability_check"
             and current.get("provider_identity") == expected_identity
             and current.get("limit") == limit and current.get("items_sha256") == items_sha256
             and current.get("items_path") == resolved_path):
-        return current
+        if current.get("runtime") == runtime_identity():
+            return current
     return capability_check(output_path, provider, items_path=resolved_path, limit=limit)
 
 
-def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu", layers, strengths,
-                  positions=("all",), random_seeds=(), temperature=0.0, max_output_tokens=512, seed=42,
-                  ridge=1.0, limit=None, capability=True, capability_items_path=None, capability_limit=None):
-    """Layer x position x strength sweep of steered inference on TEST-split pairs only.
+def freeze_steering_selection(grid_path, output_path, *, layer, position, strength):
+    """Bind one completed dev cell before evaluating its held-out behavior."""
+    from .core import atomic_text
+    manifest = _read_json_file(grid_path)
+    if not manifest or manifest.get("evaluation_split") != "dev" or not manifest.get("complete"):
+        raise ValueError("Selection requires a completed dev grid")
+    if not manifest.get("controls_complete"):
+        raise ValueError("Selection requires random controls and capability checks")
+    cells = [row for row in manifest["runs"] if row["kind"] == "learned" and row["layer"] == layer
+             and row["position"] == position and row["strength"] == strength]
+    if len(cells) != 1 or strength == 0:
+        raise ValueError("Select exactly one nonzero learned dev cell")
+    probe = manifest["probes"][str(layer)]
+    payload = {"kind": "frozen_steering_selection", "schema_version": 1,
+               "dev_grid_sha256": _artifact_digest(grid_path), "dev_grid_path": str(Path(grid_path).resolve()),
+               "settings": manifest["settings"], "layer": layer, "position": position, "strength": strength,
+               "probe_path": str(Path(probe["path"]).resolve()), "probe_sha256": probe["sha256"],
+               "activation_path": str(Path(probe["activations"]).resolve()),
+               "activation_sha256": _artifact_digest(probe["activations"]),
+               "limitation": "Local freeze is an integrity aid; external registration is still required for confirmatory claims."}
+    atomic_text(output_path, json.dumps(payload, indent=2, allow_nan=False) + "\n")
+    return dict(payload, output=str(output_path))
 
-    Per layer: extract final-prompt-token activations of the event/neutral
-    trials (one event valence only), fit the probe on the train split, then run
-    ``core.run_trials`` on whole test-split pairs for a zero-strength baseline,
-    every position x strength with the learned direction, and every random seed
-    x position x strength with a norm-matched random direction. With
-    ``capability`` each cell also gets a ``capability_check.json``. The manifest
-    ``grid.json`` records all settings and counts. Behavior differences from the
-    baseline are descriptive only: compare them against random directions and the
-    capability check; nothing here is a causal-mediation estimate. Runs are
-    resumable: finished cells are not regenerated and activations/probes whose
-    provenance and hashes still match are reused. One loaded model serves every cell.
+
+def _paired_grid_changes(reference, intervention):
+    """Keep invalidation and improvement visible on exactly shared trial/item IDs."""
+    from .core import read_jsonl
+    base = {r["trial"]["trial_id"]: r for r in read_jsonl(Path(reference["dir"]) / "records.jsonl")}
+    changed = {r["trial"]["trial_id"]: r for r in read_jsonl(Path(intervention["dir"]) / "records.jsonl")}
+    if set(base) != set(changed):
+        raise ValueError("Paired steering runs do not share the same task roster")
+    transitions, deltas = {}, {}
+    for key in sorted(base):
+        a, b = base[key]["result"], changed[key]["result"]
+        status = a["status"] + "->" + b["status"]
+        transitions[status] = transitions.get(status, 0) + 1
+        if a["status"] == b["status"] == "ok":
+            for metric, value in a["payload"].items():
+                if isinstance(value, (int, float)):
+                    deltas.setdefault(metric, []).append(float(b["payload"][metric]) - float(value))
+    result = {"n_paired_trials": len(base), "validity_transitions": transitions,
+              "behavior_mean_change_both_valid": {k: sum(v) / len(v) for k, v in deltas.items()},
+              "behavior_n_both_valid": {k: len(v) for k, v in deltas.items()}}
+    if reference["capability"] and intervention["capability"]:
+        a = _read_json_file(reference["capability"]["path"])
+        b = _read_json_file(intervention["capability"]["path"])
+        if a["items_sha256"] != b["items_sha256"]:
+            raise ValueError("Paired capability materials changed between cells")
+        before = {(r["language"], r["item_id"]): r for r in a["records"]}
+        after = {(r["language"], r["item_id"]): r for r in b["records"]}
+        if before.keys() != after.keys():
+            raise ValueError("Paired capability item roster mismatch")
+        result["capability"] = {"n_translated_responses": len(before),
+            "n_independent_authored_items": len({key[1] for key in before}),
+            "correct_to_incorrect": sum(before[k]["correct"] and not after[k]["correct"] for k in before),
+            "incorrect_to_correct": sum(not before[k]["correct"] and after[k]["correct"] for k in before),
+            "valid_to_invalid": sum(before[k]["valid"] and not after[k]["valid"] for k in before),
+            "invalid_to_valid": sum(not before[k]["valid"] and after[k]["valid"] for k in before)}
+    return result
+
+
+def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu", layers, strengths,
+                  positions=("all",), random_seeds=(42,), temperature=0.0, max_output_tokens=512, seed=42,
+                  ridge=1.0, limit=None, capability=True, capability_items_path=None, capability_limit=None,
+                  evaluation_split="dev", frozen_selection=None):
+    """Fit train directions and explore dev behavior; test exactly one frozen choice.
+
+    Learned/random doses match diagonal-standardized train activation displacement.
+    Report paired validity, behavior and draft-capability changes. Completion is
+    separate from control coverage; outputs do not establish mechanism specificity.
+    Matching source/runtime/material/model/generation hashes permit cache reuse.
     """
     from .core import atomic_text, read_jsonl, run_trials, validate_trials, write_jsonl
+    from .protocol import runtime_identity
+    if evaluation_split not in ("dev", "test"):
+        raise ValueError("Steering evaluation_split must be dev or test")
+    frozen = _read_json_file(frozen_selection) if frozen_selection else None
+    if evaluation_split == "test" and not frozen:
+        raise ValueError("Test evaluation requires a frozen dev selection")
+    if evaluation_split == "dev" and frozen:
+        raise ValueError("A frozen selection is only used for test evaluation")
     layers = _grid_sequence("layers", layers, _int_value("layers"))
     strengths = _grid_sequence("strengths", strengths, _strength_value)
     positions = _grid_sequence("positions", positions, str)
@@ -1050,10 +1186,10 @@ def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu"
         conditions = {row["condition"] for row in probe_rows if row["split"] == split}
         if conditions != set(_PROBE_CONDITIONS):
             raise ValueError(f"Split {split!r} must contain both event and neutral trials.")
-    test_trials = [row for row in all_trials if row["split"] == "test"]
+    test_trials = [row for row in all_trials if row["split"] == evaluation_split]
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    test_path = directory / "test_trials.jsonl"
+    test_path = directory / f"{evaluation_split}_trials.jsonl"
     write_jsonl(test_path, test_trials)
 
     torch, tokenizer, network = runtime = _load_runtime(model, revision, device)
@@ -1064,10 +1200,33 @@ def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu"
     local_digest = _local_model_digest(model)
     shared = {"runtime": runtime, "local_model_sha256": local_digest}
     trials_sha = _trials_digest(probe_rows)
-    provenance = {index: _provenance(network, model, revision, index, local_model_sha256=local_digest)
+    provenance = {index: _provenance(network, model, revision, index, local_model_sha256=local_digest, tokenizer=tokenizer)
                   for index in resolved}
     activation_path = {index: directory / f"L{index}" / "activations.npz" for index in resolved}
     probe_path = {index: directory / f"L{index}" / "probe.npz" for index in resolved}
+    if frozen:
+        if (frozen.get("kind") != "frozen_steering_selection" or resolved != [frozen.get("layer")]
+                or strengths != [frozen.get("strength")] or positions != [frozen.get("position")]):
+            raise ValueError("Test evaluation must use exactly the frozen layer, position and strength")
+        expected_settings = {"trials_sha256": _artifact_digest(trials_path), "model": model, "revision": revision,
+                             "device": device,
+                             "temperature": temperature, "max_output_tokens": max_output_tokens, "seed": seed,
+                             "ridge": float(ridge), "random_seeds": random_seeds, "runtime": runtime_identity(),
+                             "capability_limit": capability_limit,
+                             "capability_items_sha256": _load_capability(capability_items_path)[1]}
+        if limit is not None or not capability or not random_seeds:
+            raise ValueError("Frozen test evaluation requires full tasks, random controls and capability checks")
+        if any(frozen["settings"].get(k) != v for k, v in expected_settings.items()):
+            raise ValueError("Frozen selection source/model/runtime/generation/material settings changed")
+        if _artifact_digest(frozen["dev_grid_path"]) != frozen["dev_grid_sha256"]:
+            raise ValueError("Frozen dev grid hash mismatch")
+        for key, destination in (("probe", probe_path[resolved[0]]), ("activation", activation_path[resolved[0]])):
+            source = Path(frozen[key + "_path"])
+            if _artifact_digest(source) != frozen[key + "_sha256"]:
+                raise ValueError("Frozen steering artifact hash mismatch")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.resolve() != destination.resolve():
+                shutil.copyfile(source, destination)
 
     stale = []
     for index in resolved:
@@ -1076,6 +1235,8 @@ def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu"
         if metadata is None or any(metadata.get(key) != value for key, value in expected.items()):
             stale.append(index)
     if stale:
+        if frozen:
+            raise ValueError("Frozen activation provenance changed; do not refit after selection")
         captured = _capture_activations(torch, tokenizer, network, device, probe_rows, stale,
                                         provenance[stale[0]]["width"])
         for index in stale:
@@ -1089,11 +1250,14 @@ def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu"
         metadata = _artifact_metadata(probe_path[index]) if probe_path[index].exists() else None
         if (metadata is not None and metadata.get("kind") == "ridge_condition_probe"
                 and metadata.get("activation_sha256") == activation_sha
+                and metadata.get("report", {}).get("evaluation_split") == ("dev" if frozen else evaluation_split)
                 and metadata.get("report", {}).get("ridge") == float(ridge)):
             report = dict(metadata["report"], output=str(probe_path[index]))
             reused = True
         else:
-            report = fit_probe(activation_path[index], probe_path[index], ridge=ridge)
+            if frozen:
+                raise ValueError("Frozen probe metadata changed; do not refit after selection")
+            report = fit_probe(activation_path[index], probe_path[index], ridge=ridge, evaluation_split=evaluation_split)
             reused = False
         probes[index] = {"report": report, "reused": reused}
 
@@ -1104,23 +1268,27 @@ def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu"
         "max_output_tokens": max_output_tokens, "seed": seed, "ridge": float(ridge), "limit": limit,
         "capability": capability, "capability_items_path": capability_items_path,
         "capability_limit": capability_limit,
+        "trials_sha256": _artifact_digest(trials_path), "runtime": runtime_identity(),
+        "capability_items_sha256": _load_capability(capability_items_path)[1] if capability else None,
+        "steering_dose": "activation_std",
     }
     runs = []
     manifest = {
         "schema_version": 1, "kind": "steering_grid", "complete": False, "settings": settings,
-        "event_valence": valences[0], "test_only": True,
-        "restriction": "Steered generation runs only on whole test-split pairs "
-                       f"({len(test_trials)} trials in {directory / 'test_trials.jsonl'}); the probe is fit on the train split.",
-        "random_direction_note": "Random runs use norm-matched random directions per seed; zero strength "
+        "event_valence": valences[0], "test_only": evaluation_split == "test", "evaluation_split": evaluation_split,
+        "controls_complete": bool(random_seeds) and capability,
+        "frozen_selection_sha256": _artifact_digest(frozen_selection) if frozen else None,
+        "restriction": "Train directions; select behavior on dev; evaluate one frozen setting on test. All outputs remain exploratory without external registration.",
+        "random_direction_note": "Random and learned runs match unit displacement in diagonal-standardized train activation space; not full covariance or downstream disruption. Zero strength "
                                  "random runs are skipped because they equal the baseline.",
         "interpretation": "Behavior differences from the zero baseline are descriptive; judge them against the "
                           "random-direction runs and capability checks. No causal mediation is claimed.",
         "probes": {str(index): {"path": str(probe_path[index]), "activations": str(activation_path[index]),
                                 "reused": probes[index]["reused"],
                                 "sha256": _artifact_digest(probe_path[index]),
-                                "test_accuracy": probes[index]["report"]["splits"]["test"]["accuracy"],
-                                "text_baseline_test_accuracy":
-                                    probes[index]["report"]["probe_vs_text_baseline"]["text_baseline_test_accuracy"],
+                                "evaluation_accuracy": probes[index]["report"]["splits"][probes[index]["report"]["evaluation_split"]]["accuracy"],
+                                "text_baseline_evaluation_accuracy":
+                                    probes[index]["report"]["probe_vs_text_baseline"]["text_baseline_accuracy"],
                                 "probe_vs_text_baseline": probes[index]["report"]["probe_vs_text_baseline"]["difference"]}
                    for index in resolved},
         "runs": runs,
@@ -1130,7 +1298,7 @@ def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu"
         provider = OpenWeightProvider(
             model, revision, device, temperature, max_output_tokens, seed,
             steering_path=str(probe_path[index]), strength=strength, layer=index,
-            random_direction_seed=random_seed, steering_positions=position, _shared=shared)
+            random_direction_seed=random_seed, steering_positions=position, steering_dose="activation_std", _shared=shared)
         summary = run_trials(test_path, run_dir, provider, concurrency=1, limit=limit)
         row = {"layer": index, "kind": kind, "position": position, "strength": strength,
                "random_seed": random_seed, "dir": str(run_dir), "executed": summary["executed"],
@@ -1143,6 +1311,13 @@ def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu"
             row["capability"] = {"path": str(target), "overall": current["overall"],
                                  "per_language": current["per_language"]}
         runs.append(row)
+        if kind != "baseline":
+            baseline = next(r for r in runs if r["layer"] == index and r["kind"] == "baseline")
+            row["paired_vs_baseline"] = _paired_grid_changes(baseline, row)
+        if kind == "random":
+            learned = next(r for r in runs if r["layer"] == index and r["kind"] == "learned"
+                           and r["position"] == position and r["strength"] == strength)
+            row["paired_vs_learned"] = _paired_grid_changes(learned, row)
 
     try:
         for index in resolved:

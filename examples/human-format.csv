@@ -1,1 +1,1 @@
-trial_id,subject_id,gold_pct,equity_pct,cash_pct,buy_now,timing_days,willingness_to_pay_inr,expected_return_pct,rationale
+study_id,subject_id,trial_id,position,submitted_at,gold_pct,equity_pct,cash_pct,buy_now,timing_days,willingness_to_pay_inr,expected_return_pct,rationale

@@ -21,6 +21,7 @@ from pathlib import Path
 from statistics import fmean, median
 
 from .core import load_records, normalize_result, read_jsonl, strict_json, validate_trials, write_jsonl
+from .inference import ASSUMPTION, MIN_SCENARIOS, estimate, inference_scope
 
 PAYLOAD_METRICS = (
     "gold_pct", "equity_pct", "cash_pct", "buy_now", "timing_days",
@@ -54,7 +55,7 @@ HUMAN_FIELDS = ("trial_id", "subject_id", *PAYLOAD_FIELDS)
 CONTEXT_FIELDS = ("date", "series", "value", "unit", "source", "event")
 GROUP_FIELDS = (
     "provider", "requested_model", "model_version", "generation_settings",
-    "language", "festival", "cue", "role", "persona_id",
+    "language", "festival", "cue", "role", "persona_id", "split",
 )
 TASK_FIELDS = (
     "cluster_id", "scenario_id", "split", "festival", "cue", "role",
@@ -89,7 +90,7 @@ BOUNDED = {
     "gold_pct": (0.0, 100.0), "equity_pct": (0.0, 100.0), "cash_pct": (0.0, 100.0),
     "buy_now": (0.0, 1.0), "reserve_violation": (0.0, 1.0), "return_claim_violation": (0.0, 1.0),
 }
-MIN_SCENARIOS_FOR_GENERAL_CLAIMS = 8
+MIN_SCENARIOS_FOR_GENERAL_CLAIMS = MIN_SCENARIOS
 PARTICIPANT_REQUIRED = ("subject_id", "survey_language", "language_proficiency",
                         "financial_literacy", "observance_self_report")
 PARTICIPANT_OPTIONAL = ("age_band", "region")
@@ -97,7 +98,8 @@ PARTICIPANT_LANGUAGES = ("en", "hi", "ta", "gu", "bn")
 VALIDITY_DIMENSIONS = (("all", None), ("language", 4), ("festival", 5), ("cue", 6),
                        ("role", 7), ("persona", 8), ("condition", "condition"))
 PREREG_KEYS = {"schema_version", "primary", "primary_adjustment", "exploratory_adjustment", "_note",
-               "return_tolerance_pp"}
+               "return_tolerance_pp", "inference_method", "inference_assumption", "registration",
+               "evaluation_splits", "target_population", "template_weighting"}
 PREREG_ENTRY_KEYS = {"id", "table", "metric", "contrast", "filters", "minimum_meaningful_effect",
                      "expected_tests"}
 PREREG_FILTER_KEYS = (*GROUP_FIELDS, "source")
@@ -233,49 +235,30 @@ def _interval(draws):
     return (_percentile(draws, .025), _percentile(draws, .975)) if draws else (None, None)
 
 
-def _bootstrap_p(draws):
-    """Two-sided add-one bootstrap p: min(1, 2*min(#(b<=0)+1, #(b>=0)+1)/(B+1))."""
-    if not draws:
-        return None
-    below = sum(1 for value in draws if value <= 0)
-    above = sum(1 for value in draws if value >= 0)
-    return min(1.0, 2.0 * min(below + 1, above + 1) / (len(draws) + 1))
-
-
 def _cluster_values(pairs, metric, field="diff"):
-    # Equal subject weighting within each scenario, then equal scenario weighting.
+    # Replicates within template, templates within subject, subjects within scenario.
     cells = defaultdict(list)
     for pair in pairs:
-        cells[(pair["cluster"], pair["subject"])].append(pair[field][metric])
+        reference = pair.get("a") or pair.get("b") or {}
+        trial = reference.get("trial", reference)
+        cells[(pair["cluster"], pair["subject"], trial.get("template_id"))].append(pair[field][metric])
+    subjects = defaultdict(list)
+    for (cluster, subject, _template), values in cells.items():
+        subjects[cluster, subject].append(fmean(values))
     clusters = defaultdict(list)
-    for (cluster, _subject), values in cells.items():
+    for (cluster, _subject), values in subjects.items():
         clusters[cluster].append(fmean(values))
     return {cluster: fmean(values) for cluster, values in clusters.items()}
 
 
-def _estimate_all(values_by_metric, bootstrap, rng):
-    """{metric: (estimate, ci_low, ci_high, p_value)}; one scenario resample serves every metric."""
-    names = list(values_by_metric)
-    clusters = sorted({cluster for values in values_by_metric.values() for cluster in values})
-    n = len(clusters)
-    if not n:
-        return {name: (None, None, None, None) for name in names}
-    vectors = {name: [values_by_metric[name][cluster] for cluster in clusters] for name in names}
-    draws = {name: [] for name in names}
-    if n >= 2 and bootstrap:
-        for _ in range(bootstrap):
-            indices = rng.choices(range(n), k=n)
-            for name, vector in vectors.items():
-                draws[name].append(math.fsum([vector[i] for i in indices]) / n)
-    result = {}
-    for name in names:
-        low, high = _interval(draws[name])
-        result[name] = (fmean(vectors[name]), low, high, _bootstrap_p(draws[name]))
-    return result
+def _estimate_all(values_by_metric, bootstrap, rng, *, inferential=True):
+    """Default descriptive estimates; optional justified sign-flip p-values, no bootstrap p-values."""
+    return {name: estimate([values[k] for k in sorted(values)], inferential=inferential)
+            for name, values in values_by_metric.items()}
 
 
 def _ci_reason(low, bootstrap):
-    return "" if low is not None else ("bootstrap_disabled" if not bootstrap else "fewer_than_two_clusters")
+    return "" if low is not None else "population_interval_not_established"
 
 
 def _inference_blank(metric):
@@ -342,6 +325,9 @@ def _prepare(records, label, return_tolerance_pp=DEFAULT_RETURN_TOLERANCE_PP):
             if trial.get("condition") not in CONDITIONS:
                 raise ValueError(f"condition must be one of {', '.join(CONDITIONS)}")
             economics = _economics(trial)
+            if (not isinstance(trial.get("prompt"), str) or
+                    hashlib.sha256(trial["prompt"].encode()).hexdigest() != trial.get("prompt_sha256")):
+                raise ValueError("prompt_hash_mismatch")
             normalized = _normalize_payload(result, trial)
             counts[group][normalized["status"]] += 1
             if group[2] is None:
@@ -440,13 +426,17 @@ def _contrast_sets(buckets, contrasts, label, exclusions):
         for name in contrasts:
             a_name, b_name = CONTRASTS[name]
             item_a, item_b = bucket["items"].get(a_name), bucket["items"].get(b_name)
+            if item_a is None and item_b is None:
+                missing.append(name)
+                continue
+            reference = item_a or item_b
+            base = {"pair_id": bucket["pair_id"], "subject": bucket["subject"],
+                    "subjects": [bucket["subject"]] if bucket["subject"] is not None else [],
+                    "cluster": reference["trial"]["cluster_id"]}
+            attempted[name][bucket["group"]].append({**base, "a": item_a, "b": item_b})
             if item_a is None or item_b is None:
                 missing.append(name)
                 continue
-            base = {"pair_id": bucket["pair_id"], "subject": bucket["subject"],
-                    "subjects": [bucket["subject"]] if bucket["subject"] is not None else [],
-                    "cluster": item_a["trial"]["cluster_id"]}
-            attempted[name][bucket["group"]].append({**base, "a": item_a, "b": item_b})
             if item_a["metrics"] is None or item_b["metrics"] is None:
                 not_ok.append(name)
                 continue
@@ -570,7 +560,7 @@ def _effects(prepared, sets, contrasts, bootstrap, seed):
         for contrast in contrasts:
             pairs = sets["complete"][contrast].get(group, [])
             values = {metric: _cluster_values(pairs, metric) for metric in METRICS}
-            stats = _estimate_all(values, bootstrap, _rng(seed, [source, contrast, group]))
+            stats = _estimate_all(values, bootstrap, _rng(seed, [source, contrast, group]), inferential=source == "model")
             rows.extend(_effect_row(group, source, contrast, metric, stats[metric], pairs,
                                     len(values[metric]), bootstrap) for metric in METRICS)
     return rows
@@ -605,9 +595,15 @@ def _interactions(prepared, sets, contrasts, bootstrap, seed, exclusions):
                                            "reason": f"ambiguous_{label}_task_match", "detail": ""})
                         continue
                     target, baseline = left[key][0], right[key][0]
+                    if (target["a"].get("economics") != baseline["a"].get("economics") or
+                            target["a"].get("data_sha256") != baseline["a"].get("data_sha256")):
+                        exclusions.append({"source": source, "record_index": "", "contrast": contrast,
+                                           "pair_id": target["pair_id"] + "," + baseline["pair_id"],
+                                           "reason": f"{label}_material_metadata_mismatch", "detail": "economics or material identity differs"})
+                        continue
                     matched.append({**target, "diff": {m: target["diff"][m] - baseline["diff"][m] for m in METRICS}})
                 values = {metric: _cluster_values(matched, metric) for metric in METRICS}
-                stats = _estimate_all(values, bootstrap, _rng(seed, ["interaction", source, label, contrast, group]))
+                stats = _estimate_all(values, bootstrap, _rng(seed, ["interaction", source, label, contrast, group]), inferential=source == "model")
                 for metric in METRICS:
                     estimate, low, high, p_value = stats[metric]
                     tables[table].append({
@@ -727,8 +723,8 @@ def _validity_rows(prepared, sets, contrasts, bootstrap, seed, contrast_effects=
     for group in sorted(prepared["seen"], key=_canonical):
         for contrast in contrasts:
             attempted = sets["attempted"][contrast].get(group, [])
-            pairs = [{**pair, "diff": {"valid": float(pair["a"]["metrics"] is not None) -
-                                       float(pair["b"]["metrics"] is not None)}} for pair in attempted]
+            pairs = [{**pair, "diff": {"valid": float(pair["a"] is not None and pair["a"]["metrics"] is not None) -
+                                       float(pair["b"] is not None and pair["b"]["metrics"] is not None)}} for pair in attempted]
             values = {"valid": _cluster_values(pairs, "valid")}
             estimate, low, high, _p = _estimate_all(values, bootstrap, _rng(seed, ["validity", source, contrast, group]))["valid"]
             rows.append({**_group_row(group), "source": source, "row_type": "contrast_difference",
@@ -740,7 +736,7 @@ def _validity_rows(prepared, sets, contrasts, bootstrap, seed, contrast_effects=
 
 
 def _side_bounds(item, metric, economics):
-    if item["metrics"] is not None:
+    if item is not None and item["metrics"] is not None:
         value = item["metrics"][metric]
         return value, value
     if metric == "timing_days":
@@ -762,7 +758,7 @@ def _bounds_rows(prepared, sets, contrasts):
             complete = sets["complete"][contrast].get(group, [])
             lows, highs = [], []
             for pair in attempted:
-                economics = pair["a"]["trial"]["economics"]
+                economics = (pair["a"] or pair["b"])["trial"]["economics"]
                 low, high = {}, {}
                 for metric in bounded:
                     a_low, a_high = _side_bounds(pair["a"], metric, economics)
@@ -775,6 +771,9 @@ def _bounds_rows(prepared, sets, contrasts):
                 row = {**_group_row(group), "source": source, "metric": metric, "unit": UNITS[metric],
                        "contrast": contrast, "n_pairs_attempted": len(attempted),
                        "n_pairs_complete": len(complete), "share_missing_one_side": share,
+                       "n_absent_records": sum(pair["a"] is None or pair["b"] is None for pair in attempted),
+                       "n_recorded_nonvalid": sum(item is not None and item["metrics"] is None
+                                                 for pair in attempted for item in (pair["a"], pair["b"])),
                        "estimate_complete_case": (fmean(_cluster_values(complete, metric).values())
                                                   if complete else None),
                        "bound_low": None, "bound_high": None, "bounds_exclude_zero": None,
@@ -793,7 +792,67 @@ def _bounds_rows(prepared, sets, contrasts):
 
 def _same_task(left, right):
     return all(left.get(field) == right.get(field) for field in
-               (*PAIR_FIELDS, *OPTIONAL_TASK_FIELDS, "pair_id", "trial_id", "condition", "prompt_sha256", "prompt"))
+               (*PAIR_FIELDS, *OPTIONAL_TASK_FIELDS, "pair_id", "trial_id", "condition", "prompt_sha256", "prompt", "economics", "data_sha256"))
+
+
+def _human_assignment_diagnostics(study, prepared, roster, selected_splits):
+    """Bound assigned-arm means, including participants who never submitted."""
+    by_id = {t["trial_id"]: t for t in roster}
+    responses = {(i["subject"], i["trial"]["trial_id"]): i for i in prepared["candidates"]}
+    arms = defaultdict(lambda: {"event": [], "neutral": []})
+    identity = ("human", "human", "self_report", "{}")
+    for key, assigned in study["index"].items():
+        trial = by_id[assigned["trial_id"]]
+        if trial["split"] not in selected_splits or trial["condition"] not in ("event", "neutral"):
+            continue
+        group = (*identity, *(trial[f] for f in GROUP_FIELDS[4:]))
+        arms[group, trial["pair_id"]][trial["condition"]].append((responses.get(key), trial))
+    bounded = tuple(BOUNDED) + ("timing_days", "reserve_shortfall_pct")
+    pairs = defaultdict(list)
+    unassigned = defaultdict(int)
+    for (group, pair_id), sides in arms.items():
+        if not all(sides.values()):
+            unassigned[group] += 1
+            continue
+        reference = sides["event"][0][1]
+        pair = {"cluster": reference["cluster_id"], "subject": None, "pair_id": pair_id,
+                "a": reference, "diff_low": {}, "diff_high": {}, "diff": {},
+                "n_absent": 0, "n_nonvalid": 0, "n_assigned": 0}
+        for values in sides.values():
+            pair["n_assigned"] += len(values)
+            pair["n_absent"] += sum(item is None for item, _ in values)
+            pair["n_nonvalid"] += sum(item is not None and item["metrics"] is None for item, _ in values)
+        for metric in bounded:
+            limits = {name: [_side_bounds(item, metric, trial["economics"]) for item, trial in values]
+                      for name, values in sides.items()}
+            pair["diff_low"][metric] = fmean(v[0] for v in limits["event"]) - fmean(v[1] for v in limits["neutral"])
+            pair["diff_high"][metric] = fmean(v[1] for v in limits["event"]) - fmean(v[0] for v in limits["neutral"])
+        pair["diff"]["valid"] = (fmean(float(i is not None and i["metrics"] is not None) for i, _ in sides["event"])
+                                     - fmean(float(i is not None and i["metrics"] is not None) for i, _ in sides["neutral"]))
+        pairs[group].append(pair)
+    bounds, validity = [], []
+    for group in sorted(set(pairs) | set(unassigned), key=_canonical):
+        tasks = pairs[group]
+        for metric in bounded:
+            low = fmean(_cluster_values(tasks, metric, "diff_low").values()) if tasks else None
+            high = fmean(_cluster_values(tasks, metric, "diff_high").values()) if tasks else None
+            bounds.append({**_group_row(group), "source": "human_assignment", "metric": metric,
+                           "unit": UNITS[metric], "contrast": PRIMARY_CONTRAST,
+                           "bound_low": low, "bound_high": high,
+                           "bounds_exclude_zero": low > 0 or high < 0 if tasks else None,
+                           "n_pairs_attempted": len(tasks), "n_pairs_complete": sum(not p["n_absent"] and not p["n_nonvalid"] for p in tasks),
+                           "n_absent_records": sum(p["n_absent"] for p in tasks),
+                           "n_recorded_nonvalid": sum(p["n_nonvalid"] for p in tasks),
+                           "n_clusters_attempted": len({p["cluster"] for p in tasks}),
+                           "n_tasks_missing_assigned_arm": unassigned[group],
+                           "estimand": "equal_planned_tasks_assigned_subject_arm_means",
+                           "skipped_reason": "no_tasks_assigned_both_arms" if not tasks else ""})
+        validity.append({**_group_row(group), "source": "human_assignment", "row_type": "assigned_validity_difference",
+                         "contrast": PRIMARY_CONTRAST,
+                         "estimate": fmean(_cluster_values(tasks, "valid").values()) if tasks else None,
+                         "n_pairs": len(tasks), "n_clusters": len({p["cluster"] for p in tasks}),
+                         "ci_low": None, "ci_high": None, "ci_unavailable_reason": "descriptive_assigned_sample_only"})
+    return bounds, validity
 
 
 def _comparison_row(group, design, estimate, low, high, draws, bootstrap, matched_model, matched_units,
@@ -1013,7 +1072,9 @@ def _load_prereg(path):
                         "minimum_meaningful_effect": float(mme), "expected_tests": expected})
     return {"sha256": sha256, "path": str(path), "primary": entries,
             "primary_adjustment": "holm", "exploratory_adjustment": exploratory,
-            "return_tolerance_pp": tolerance}
+            "return_tolerance_pp": tolerance,
+            **{key: data.get(key) for key in ("inference_method", "inference_assumption", "registration",
+                                             "evaluation_splits", "target_population", "template_weighting")}}
 
 
 def _holm(p_values):
@@ -1153,7 +1214,7 @@ def _participant_from_row(row, where):
     return entry
 
 
-def import_participants(csv_path, output_path):
+def import_participants(csv_path, output_path, *, assignment_path=None, instrument_path=None):
     """Strictly import self-reported participant covariates; nothing is imputed.
 
     Required columns: subject_id, survey_language (en|hi|ta|gu|bn),
@@ -1174,11 +1235,31 @@ def import_participants(csv_path, output_path):
         seen.add(entry["subject_id"])
         participants.append(entry)
     by_language = Counter(entry["survey_language"] for entry in participants)
+    provenance = {"csv_sha256": hashlib.sha256(Path(csv_path).read_bytes()).hexdigest(),
+                  "assignment_status": "unverified_legacy", "instrument_status": "unverified"}
+    if assignment_path:
+        from .protocol import load_assignments
+        study = load_assignments(assignment_path)
+        expected = {row["subject_id"]: row["language"] for row in study["rows"]}
+        if any(expected.get(p["subject_id"]) != p["survey_language"] for p in participants):
+            raise ValueError("Participant subject/language does not match this study's assignments")
+        provenance.update(study_id=study["study_id"], assignment_manifest_sha256=study["manifest_sha256"],
+                          assignment_status="bound_to_study")
+    if instrument_path:
+        instrument_raw = Path(instrument_path).read_bytes()
+        instrument = strict_json(instrument_raw.decode("utf-8"))
+        if not isinstance(instrument, dict) or any(not str(instrument.get(k, "")).strip()
+                                                 for k in ("id", "version", "source", "scoring")):
+            raise ValueError("Instrument needs id, version, source and scoring documentation")
+        provenance.update(instrument=instrument, instrument_sha256=hashlib.sha256(instrument_raw).hexdigest(),
+                          instrument_status="documented_not_independently_validated")
     document = {"schema_version": 1, "n_participants": len(participants), "participants": participants,
+                "provenance": provenance,
                 "notes": "Self-reported covariates. financial_literacy is a researcher-defined numeric score; instrument and scale are not validated here. Used for descriptive heterogeneity only, never to adjust the model-human comparison."}
     _json_write(output_path, document)
     return {"participants": len(participants), "by_survey_language": dict(sorted(by_language.items())),
-            "output": str(output_path), "warnings": []}
+            "output": str(output_path), "warnings": [] if assignment_path and instrument_path else
+            ["Study and/or instrument provenance unverified; descriptive covariates only."]}
 
 
 def _load_participants(path):
@@ -1260,7 +1341,7 @@ def _heterogeneity(buckets, design, participants, bootstrap, seed, exclusions):
             sets = _human_sets(buckets, design, "human_heterogeneity", [], subjects=members)
             pairs = [pair for group in sets["complete"][PRIMARY_CONTRAST].values() for pair in group]
             values = {metric: _cluster_values(pairs, metric) for metric in METRICS}
-            stats = _estimate_all(values, bootstrap, _rng(seed, ["heterogeneity", covariate, level, language]))
+            stats = _estimate_all(values, bootstrap, _rng(seed, ["heterogeneity", covariate, level, language]), inferential=False)
             for metric in METRICS:
                 estimate, low_ci, high_ci, _p = stats[metric]
                 rows.append({"covariate": covariate, "level": level, "survey_language": language,
@@ -1302,12 +1383,23 @@ def _design_summary(prepared):
 
 
 def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=None, prereg_path=None,
-            human_design="auto", participants_path=None, return_tolerance_pp=None):
-    """Write contrasts, interactions, validity/bounds/scenario diagnostics and adjusted inference.
+            human_design="auto", participants_path=None, return_tolerance_pp=None, trials_path=None,
+            evaluation_splits=("test",), inference_method=None, assignment_path=None):
+    plan = _load_prereg(prereg_path) if prereg_path is not None else None
+    method = inference_method or (plan.get("inference_method") if plan else None) or "descriptive"
+    if method != "descriptive" and (plan is None or plan.get("inference_assumption") != ASSUMPTION):
+        raise ValueError("Sign-flip inference requires the registered independent sign-symmetry assumption")
+    with inference_scope(method):
+        return _analyze(records_path, output_dir, bootstrap=bootstrap, seed=seed, human_path=human_path,
+                        prereg_path=prereg_path, human_design=human_design, participants_path=participants_path,
+                        return_tolerance_pp=return_tolerance_pp, trials_path=trials_path,
+                        evaluation_splits=evaluation_splits, inference_method=method, assignment_path=assignment_path)
 
-    CIs are 95% scenario-cluster percentile intervals. Coverage denominators describe
-    observed records/pairs, not trials absent from the supplied result files.
-    """
+
+def _analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=None, prereg_path=None,
+             human_design="auto", participants_path=None, return_tolerance_pp=None, trials_path=None,
+             evaluation_splits=("test",), inference_method="descriptive", assignment_path=None):
+    """Write descriptive effects and attrition; gate opt-in sign-symmetry inference."""
     if isinstance(bootstrap, bool) or not isinstance(bootstrap, int) or bootstrap < 0:
         raise ValueError("bootstrap must be a nonnegative integer")
     if isinstance(seed, bool) or not isinstance(seed, int):
@@ -1317,6 +1409,11 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
     if participants_path is not None and human_path is None:
         raise ValueError("participants_path requires human_path")
     prereg = _load_prereg(prereg_path) if prereg_path is not None else None
+    selected_splits = set(evaluation_splits)
+    if not selected_splits or not selected_splits <= {"train", "dev", "test"}:
+        raise ValueError("evaluation_splits must select train, dev and/or test")
+    if prereg and prereg.get("evaluation_splits") is not None and selected_splits != set(prereg["evaluation_splits"]):
+        raise ValueError("Selected splits differ from the prospectively frozen evaluation splits")
     registered_tolerance = prereg.get("return_tolerance_pp") if prereg else None
     if return_tolerance_pp is not None:
         return_tolerance_pp = _return_tolerance(return_tolerance_pp)
@@ -1327,10 +1424,34 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
                                else DEFAULT_RETURN_TOLERANCE_PP)
     participants = _load_participants(participants_path) if participants_path is not None else None
     records = load_records(records_path)
+    roster = read_jsonl(trials_path) if trials_path is not None else None
+    if roster is not None:
+        from .protocol import validate_roster
+        validate_trials(roster)
+        validate_roster(records, roster)
+    records = [r for r in records if not isinstance(r.get("trial"), dict)
+               or r["trial"].get("split") not in ("train", "dev", "test")
+               or r["trial"].get("split") in selected_splits]
+    if inference_method != "descriptive":
+        from .protocol import collection_protocol, verify_bound_records
+        from .core import load_review_context
+        if roster is None:
+            raise ValueError("Inference requires the original --trials roster")
+        collection_protocol(prereg_path, confirmatory=True)
+        validate_trials(roster, confirmatory=True, review_context=load_review_context(trials_path, True))
+        verify_bound_records(records, prereg["sha256"], trials=roster,
+                             registered_at=prereg["registration"]["registered_at"])
+        expected = {t["trial_id"] for t in roster if t["split"] in selected_splits}
+        observed = {r["trial"]["trial_id"] for r in records}
+        if observed != expected or any(r["result"].get("status") != "ok" for r in records):
+            raise ValueError("This inference procedure requires every planned evaluation outcome to be observed and valid")
     if any(isinstance(r, dict) and isinstance(r.get("result"), dict) and
            r["result"].get("provider") == "human" for r in records):
         raise ValueError("Model records must not contain human providers; use human_path")
     model = _prepare(records, "model", return_tolerance_pp)
+    if inference_method != "descriptive" and (model["exclusions"] or len(records) != len(expected)
+                                               or any(i["metrics"] is None for i in model["candidates"])):
+        raise ValueError("Inference requires a single structurally valid observation for every planned task")
     return_levels = _return_claim_levels(model)
     contrasts = _select_contrasts(model["candidates"])
     model_sets = _contrast_sets(model["buckets"], contrasts, "model", model["exclusions"])
@@ -1345,16 +1466,30 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
     exclusions = list(model["exclusions"])
     warnings = set(model["warnings"])
     design_summary = {"model": _design_summary(model)}
-    comparisons, human_participant_rows, heterogeneity = [], [], []
+    comparisons, human_participant_rows, heterogeneity, human_flow = [], [], [], []
+    administration = None
     record_totals = {"model": len(records)}
     resolved_design = None
     if human_path is not None:
         human_records = load_records(human_path)
+        if roster is not None:
+            validate_roster(human_records, roster)
+        human_records = [r for r in human_records if not isinstance(r.get("trial"), dict)
+                         or r["trial"].get("split") not in ("train", "dev", "test")
+                         or r["trial"].get("split") in selected_splits]
         record_totals["human"] = len(human_records)
         if any(not isinstance(r, dict) or not isinstance(r.get("result"), dict) or
                r["result"].get("provider") != "human" for r in human_records):
             raise ValueError("human_path must contain imported human result records only")
         human = _prepare(human_records, "human", return_tolerance_pp)
+        if assignment_path:
+            if roster is None:
+                raise ValueError("Assignment-aware analysis requires the original --trials roster")
+            from .protocol import assignment_flow, load_assignments
+            study = load_assignments(assignment_path, trials_path)
+            assignment_flow(study, human_records, set())
+            if any(bucket["rejected"] for bucket in human["buckets"]):
+                raise ValueError("Assigned-study records contain structurally rejected observations")
         return_levels.extend(_return_claim_levels(human))
         # A subject/trial observation may appear only once even if a caller relabels
         # its human provider model/version/generation metadata.
@@ -1366,6 +1501,34 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
             raise ValueError("Duplicate human (subject_id, trial_id) observations; comparisons would pseudoreplicate")
         resolved_design = _resolve_human_design(human["buckets"], human_design)
         human_sets = _human_sets(human["buckets"], resolved_design, "human", human["exclusions"])
+        if assignment_path:
+            from .protocol import administration_summary, assignment_flow, load_assignments
+            if roster is None:
+                raise ValueError("Assignment-aware analysis requires the original --trials roster")
+            study = load_assignments(assignment_path, trials_path)
+            if participants_path:
+                participant_document = strict_json(Path(participants_path).read_text(encoding="utf-8"))
+                provenance = participant_document.get("provenance", {})
+                if (provenance.get("assignment_manifest_sha256") != study["manifest_sha256"]
+                        or not provenance.get("instrument_sha256")):
+                    raise ValueError("Assigned-study covariates require the same assignment manifest and documented instrument")
+            analysed_ids = set()
+            for pairs in human_sets["complete"][PRIMARY_CONTRAST].values():
+                for pair in pairs:
+                    if resolved_design == "within":
+                        analysed_ids.update((pair["subject"], pair[side]["trial_id"]) for side in ("a", "b"))
+                    else:
+                        for side, responders in (("a", "event_resp"), ("b", "neutral_resp")):
+                            analysed_ids.update((subject, pair[side]["trial_id"]) for subject, _ in pair[responders])
+            normalized_records = [{"trial": item["trial"], "result": item["result"]} for item in human["candidates"]]
+            human_flow = assignment_flow(study, normalized_records, analysed_ids,
+                                         {t["trial_id"] for t in roster if t["split"] in selected_splits})
+            administration = administration_summary(normalized_records)
+            human_bounds, human_validity = _human_assignment_diagnostics(study, human, roster, selected_splits)
+            bounds.extend(human_bounds)
+            validity.extend(human_validity)
+        else:
+            warnings.add("Human assignment provenance is unverified; assigned/nonresponse counts are unknown and estimates are descriptive.")
         human_contrasts = [PRIMARY_CONTRAST]
         coverage.extend(_coverage(human, human_sets, human_contrasts, unpaired=resolved_design == "unpaired"))
         missingness.extend(human["missingness"])
@@ -1383,7 +1546,10 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
                                        contrast_effects=False))
         comparisons = _human_comparisons(model_sets["complete"].get(PRIMARY_CONTRAST, {}),
                                          human_sets["complete"][PRIMARY_CONTRAST], resolved_design,
-                                         bootstrap, seed, exclusions)
+                                         0, seed, exclusions)
+        for row in comparisons:
+            row.update(ci_unavailable_reason="descriptive_observed_participants_only",
+                       inference_scope="descriptive_observed_participants_only")
         design_summary["human"] = _design_summary(human)
         if participants is not None:
             heterogeneity, observed = _heterogeneity(human["buckets"], resolved_design, participants,
@@ -1415,7 +1581,12 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
                                   "count": counts[status], "denominator": denominator,
                                   "fraction": counts[status] / denominator if denominator else None})
     report = {
-        "schema_version": 2, "bootstrap": bootstrap, "seed": seed, "confidence_level": .95,
+        "schema_version": 3, "bootstrap": bootstrap, "seed": seed, "confidence_level": None,
+        "inference_method": inference_method, "evaluation_splits": sorted(selected_splits),
+        "provenance": {"roster_verified": roster is not None,
+                       "planned_evaluation_trials": sum(t["split"] in selected_splits for t in roster) if roster else None,
+                       "observed_model_records": len(records),
+                       "collection_protocol_verified": inference_method != "descriptive"},
         "return_tolerance_pp": return_tolerance_pp, "return_claim_levels": return_levels,
         "contrasts": contrasts, "primary_contrast": PRIMARY_CONTRAST, "human_design": resolved_design,
         "effects": effects, **interaction_tables, "validity_effects": validity,
@@ -1423,28 +1594,41 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
         "template_effects_rows": len(template_effects), "scenario_effect_rows": len(scenario_effects),
         "human_comparisons": comparisons, "human_participants": human_participant_rows,
         "human_heterogeneity": heterogeneity,
+        "human_assignment_flow": human_flow,
+        "human_administration": administration,
+        "research_scope": {
+            "status": "exploratory_prompt_sensitivity",
+            "controls": "Existing controls are robustness comparisons with wording, norm, length and occasion confounds.",
+            "languages": "AI-drafted translations; language plus wording until independent bilingual review and comprehension checks.",
+            "calendar": "Named/explicit cues do not test unprompted date recognition; one avoidance occasion cannot separate valence from identity.",
+            "outcomes": "Recommendation sensitivity, factual compliance, constraint compliance and hypothetical preferences are separate outcomes; no belief or irrationality composite.",
+            "subgroups": "Observed surviving task mixtures; descriptive, not standardized covariate interactions.",
+            "external_validation_required": ["independently authored matched controls and translations", "date verification and calendar-recognition checks",
+                                             "independent scenario sampling and design-specific power/precision", "human recruitment, masking and comprehension pilot",
+                                             "lexically disjoint cues and polarity counterfactuals", "expanded validated capability items"]},
         "preregistration": preregistration, "design_summary": design_summary,
         "missingness": missingness, "pair_coverage": coverage, "exclusions": exclusions,
         "record_status_totals": status_totals,
         "warnings": sorted(warnings),
         "methods": {
             "claim": "Estimates describe calendar-cue sensitivity: the change in a particular model's (or human sample's) answers when specified prompt text changes, under the stated inference conditions. They do not measure beliefs, and they do not identify mediating mechanisms or causal pathways inside the model.",
-            "contrasts": "A_minus_B over matched conditions of the same pair. event_minus_neutral is the primary contrast (cue sensitivity). Other contrasts compare the specified occasion, purchase and no-calendar controls. Persona interactions address preference accommodation; cue interactions compare wording; language interactions compare matched tasks with English, with wording and language still confounded unless independently reviewed. Absolute return error and return_claim_violation measure disagreement with a supplied assumption. The signed return-deviation contrast duplicates expected_return_pct and is diagnostic only. Reserve metrics measure failure of the stated cash-only reserve requirement.",
-            "estimand": "Mean scenario-level A-minus-B complete-pair difference; average repetitions (paraphrases, templates, replicates) within subject/scenario, then subjects within scenario, then scenarios equally. Complete-case is applied per contrast (both trials ok).",
+            "contrasts": "Effects compare specified prompt manipulations. Event-minus-control contrasts are robustness checks, not unique identification of auspiciousness, language, beliefs, preferences, or irrationality.",
+            "estimand": "Average replicates/paraphrases within template, templates equally within subject/scenario, subjects equally within scenario, scenarios equally. Descriptive complete cases retain only surviving templates; prospective inference requires all planned outcomes valid.",
             "derived_metrics": "Signed return deviation = expected_return_pct - supplied gold return; return_claim_absolute_error_pp is its absolute value; return_claim_violation is 1 when absolute error exceeds report.return_tolerance_pp, allowing numerical rounding of 1e-12 at the boundary. Reserve shortfall = max(0, 100*liquidity_need_inr/capital_inr - cash_pct), with reserve_violation = 1 above 0.01 pp. wtp_premium_pct benchmarks against the quoted unit price. cash_pct and the signed return-deviation contrast are excluded from multiplicity families as redundant; related outcomes are not independent confirmations.",
             "return_claim_levels": "Per-condition signed return deviation, absolute error and violation rate among valid responses in structurally accepted buckets. Average repetitions within subject/scenario, subjects within scenario, and scenarios equally. These descriptive levels expose errors shared by both arms; they are not additional hypothesis tests. The tolerance is loaded from preregistration when declared, otherwise defaults to 0.01 pp or an explicit exploratory override; conflicting registered and command-line values are rejected.",
-            "missingness": "No imputation in effects; pair coverage uses observed pair IDs only. Grouped missingness covers attributable records; record_status_totals includes unstratifiable malformed records. Trials entirely absent from result files are not identifiable and cannot be bounded.",
-            "validity_effects": "P(status ok) for condition A minus condition B over ALL attempted pairs (both trials have a record, whatever the status), averaged within scenario then across scenarios; plus valid-rate and status breakdowns by language, festival, cue, role, persona and condition. Complete-case effects describe the surviving subset of tasks, not all attempted tasks.",
-            "bounds_effects": "Worst-case (Manski-type) bounds over attempted pairs: allocations 0-100; buy_now, reserve_violation and return_claim_violation 0-1; timing_days 0..max_delay_days; reserve_shortfall_pct 0..max(100, 100*liquidity/capital). Unbounded metrics, including absolute return error, are listed with skipped_reason. Structurally rejected or entirely absent pairs are excluded.",
-            "scenario_robustness": "scenario_effects.csv holds each scenario's own contrast estimate; scenario_robustness reports n_scenarios, the share of scenarios whose sign equals the pooled sign, and min/max. template_effects.csv gives per-template estimates when more than one template is present. Main tables pool paraphrase/template/replicate within scenario. With fewer than 8 scenarios intervals describe only the sampled scenarios.",
-            "effects_ci": "Resample scenarios with replacement (one resample shared by all metrics of a group/contrast); no independent-generation or paraphrase pseudoreplication. Human-only effects CIs condition on the observed subjects.",
-            "inference": "Two-sided add-one bootstrap p = min(1, 2*min(#(b<=0)+1, #(b>=0)+1)/(B+1)). Nonredundant effects/interactions are exploratory and BH-adjusted unless registered as primary. Primary rows use Holm; expected_tests fixes an entry's planned row count, including absent strata. Unavailable tests stay in the family as internal p=1 non-rejections, while reported p-values remain unavailable. Entries without an explicit count reserve matched rows or at least one test if unmatched. Excess matches are an error; unmatched entries also produce an error after outputs are written. Planned primary tests and available p-values are counted separately. MME flags use unadjusted 95% percentile intervals, not multiplicity-adjusted intervals. Register hypotheses, exclusions and stopping rules prospectively.",
-            "language_interactions": "Subtract reference-level (English / nonobservant / festival_named) paired effects only on identical matched task dimensions and subjects, then resample shared scenarios; persona_interactions and cue_interactions use the same rule on their dimension.",
-            "human_comparison": "Event_minus_neutral only. Exact trial IDs and task/role metadata required. 'within': each subject supplied both conditions of a pair; matched complete-case model-minus-human paired effects with crossed subject x scenario bootstrap. 'unpaired': each human response comes from a subject who saw one trial of the pair; per pair, human effect = mean of event responses minus mean of (different subjects') neutral responses (needs >=1 ok response on each side); the comparison is model pair effect minus human pair effect on identical pairs, averaged within scenario then across scenarios; the bootstrap resamples scenarios and subjects (within strata defined by the arm(s) each subject appeared in) and counts bootstrap_valid_draws; draws leaving no pair are omitted. Sparse designs can yield empty draws. Subject/scenario selection and shared-task dependence limit population generalization.",
+            "missingness": "Bounds include every structurally accepted pair with either condition observed; absent records and recorded nonvalid outcomes are separate. Entirely absent pairs need an external planned roster.",
+            "validity_effects": "Model validity uses every accepted pair with either side observed. Human assignment validity uses all assigned responses, with nonresponse invalid in the submission/validity diagnostic only.",
+            "bounds_effects": "Worst-case outcome-support bounds include absent and nonvalid records. Human assignment bounds average over all assigned subjects per task/arm, then templates/tasks within scenario and scenarios equally. Tasks never assigned one arm are flagged and excluded; bounds are not confidence intervals.",
+            "scenario_robustness": "Per-scenario effects, sign agreement, range and per-template effects describe sampled situations; crossed prompts add repetitions, not independently sampled scenarios.",
+            "effects_ci": "Population confidence intervals are suppressed. The scenario threshold is an eligibility rule, not a power justification.",
+            "inference": "No ordinary-bootstrap tail p-values or population intervals. Optional scenario sign-flip tests require a collection-bound externally attested plan, approved original roster, immutable provider identities, full valid evaluation data and explicit independent sign symmetry. Exact through 16 scenarios, otherwise add-one Monte Carlo; suppressed below 12. Fixed primary identities/counts enter Holm with unavailable tests retained. No MME/equivalence claims from unadjusted intervals.",
+            "language_interactions": "Task labels, economics and material hashes must agree across the compared dimensions; mismatches are excluded. A shared material hash does not certify translation equivalence. Human estimates remain descriptive.",
+            "human_comparison": "Exact-task model-minus-human contrasts describe observed participants only; no participant-population interval or p-value. Human subgroup estimates use surviving mixtures and do not identify standardized interactions.",
             "participants": "Optional self-reported covariates (survey language, language proficiency, researcher-defined financial literacy score, observance). human_heterogeneity.csv splits the human event_minus_neutral effect (same estimator as the chosen design) by observance (>=4 vs <=2, middle excluded and counted) and by financial literacy (<= vs > the sample median of subjects with responses); it is descriptive and is never used to adjust the model comparison. Subjects absent from the participants file are listed in exclusions.",
-            "human_unpaired_interval_eligibility": "The crossed unpaired bootstrap requires at least two scenarios and at least two independent subjects in every observed arm-membership stratum (event-only, neutral-only or counterbalanced). A singleton stratum retains the point estimate but has no population interval and reports requires_two_subjects_per_arm_stratum. Empty resamples remain counted and are omitted.",
+            "human_unpaired_interval_eligibility": "No human-population interval is established for either design; observed participant/sample contrasts are descriptive.",
             "model_identity": "Provider, requested model, returned model version and generation settings are separate strata; unresolved versions cannot prove cross-run checkpoint identity.",
             "units": UNITS,
+            "inference_scope": "Human and subgroup estimates are descriptive and never receive population p-values or adjusted significance.",
         },
     }
     directory = Path(output_dir)
@@ -1457,7 +1641,7 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
         "effects": (effects, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", *stat, "n_pairs", "n_clusters", "n_subjects", "ci_method", "ci_unavailable_reason")),
         **{name: (interaction_tables[name], interaction_columns) for name in MULTIPLICITY_TABLES},
         "validity_effects": (validity, (*GROUP_FIELDS, "source", "row_type", "dimension", "level", "contrast", "estimate", "ci_low", "ci_high", "n_pairs", "n_clusters", "n_records", "n_ok", "n_invalid", "n_blocked", "n_error", "valid_rate", "ci_method", "ci_unavailable_reason")),
-        "bounds_effects": (bounds, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "estimate_complete_case", "bound_low", "bound_high", "bounds_exclude_zero", "n_pairs_attempted", "n_pairs_complete", "share_missing_one_side", "n_clusters_attempted", "skipped_reason")),
+        "bounds_effects": (bounds, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "estimate_complete_case", "bound_low", "bound_high", "bounds_exclude_zero", "n_pairs_attempted", "n_pairs_complete", "share_missing_one_side", "n_absent_records", "n_recorded_nonvalid", "n_clusters_attempted", "n_tasks_missing_assigned_arm", "estimand", "skipped_reason")),
         "scenario_effects": (scenario_effects, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "cluster_id", "estimate", "n_pairs")),
         "scenario_robustness": (scenario_robustness, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "n_scenarios", "pooled_estimate", "share_same_sign", "min_scenario_estimate", "max_scenario_estimate")),
         "template_effects": (template_effects, (*GROUP_FIELDS, "source", "template_id", "metric", "unit", "contrast", "estimate", "ci_low", "ci_high", "n_pairs", "n_clusters", "ci_method", "ci_unavailable_reason")),
@@ -1465,6 +1649,7 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
                                                "estimate", "n_records", "n_clusters", "n_subjects")),
         "human_comparisons": (comparisons, (*GROUP_FIELDS, "metric", "unit", "contrast", "human_design", "estimate", "ci_low", "ci_high", "matched_model_pairs", "matched_human_units", "n_clusters", "n_subjects", "bootstrap_valid_draws", "ci_method", "ci_unavailable_reason", "unmatched_model_pairs")),
         "human_participants": (human_participant_rows, ("survey_language", "n_participants", "n_with_responses", "language_proficiency_mean", "language_proficiency_min", "language_proficiency_max", "financial_literacy_mean", "financial_literacy_median", "financial_literacy_min", "financial_literacy_max", "observance_mean", "observance_high_n", "observance_middle_n", "observance_low_n")),
+        "human_assignment_flow": (human_flow, ("study_id", "language", "condition", "assigned", "submitted", "valid", "analysed", "nonresponse")),
         "human_heterogeneity": (heterogeneity, ("covariate", "level", "survey_language", "split_rule", "split_value", "metric", "unit", "contrast", "human_design", "estimate", "ci_low", "ci_high", "n_subjects_in_split", "n_subjects_contributing", "n_pairs", "n_clusters", "n_middle_excluded", "ci_method", "ci_unavailable_reason")),
         "missingness": (missingness, (*GROUP_FIELDS, "source", "status", "count", "denominator", "fraction")),
         "record_status_totals": (status_totals, ("source", "status", "count", "denominator", "fraction")),
@@ -1483,7 +1668,7 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
     return report
 
 
-def import_humans(trials_path, csv_path, output_path):
+def import_humans(trials_path, csv_path, output_path, *, assignment_path=None, allow_unassigned=False):
     """Import consented, deidentified observations without inventing missing data.
 
     CSV booleans are true/false (case insensitive) or 1/0. Invalid answer cells
@@ -1495,7 +1680,11 @@ def import_humans(trials_path, csv_path, output_path):
     trials = read_jsonl(trials_path)
     validate_trials(trials)
     by_id = {trial["trial_id"]: trial for trial in trials}
-    rows = _csv_read(csv_path, HUMAN_FIELDS)
+    if assignment_path is None and not allow_unassigned:
+        raise ValueError("Human import requires --assignments; legacy data require explicit --allow-unassigned")
+    from .protocol import load_assignments
+    study = load_assignments(assignment_path, trials_path) if assignment_path else None
+    rows = _csv_read(csv_path, (*HUMAN_FIELDS, "study_id", "position") if study else HUMAN_FIELDS)
     seen = set()
     records = []
     status_counts = Counter()
@@ -1505,6 +1694,15 @@ def import_humans(trials_path, csv_path, output_path):
             raise ValueError(f"{csv_path}:{line}: unknown trial_id {trial_id!r}")
         if not subject_id:
             raise ValueError(f"{csv_path}:{line}: subject_id must not be empty")
+        assigned = None
+        if study:
+            assigned = study["index"].get((subject_id, trial_id))
+            if (assigned is None or row["study_id"].strip() != study["study_id"] or
+                    row["position"].strip() != assigned["position"] or
+                    assigned["language"] != by_id[trial_id]["language"] or
+                    assigned["condition"] != by_id[trial_id]["condition"] or
+                    assigned["prompt_sha256"] != by_id[trial_id]["prompt_sha256"]):
+                raise ValueError(f"{csv_path}:{line}: response does not match its study assignment")
         if (subject_id, trial_id) in seen:
             raise ValueError(f"{csv_path}:{line}: duplicate (subject_id, trial_id)")
         seen.add((subject_id, trial_id))
@@ -1512,6 +1710,14 @@ def import_humans(trials_path, csv_path, output_path):
         result = {"provider": "human", "requested_model": "human", "model_version": "self_report",
                   "generation": {}, "usage": {}, "attempts": 1, "subject_id": subject_id,
                   "status": "ok", "payload": None, "raw_text": _canonical(raw_cells), "error": None}
+        result["assignment"] = ({**assigned, "manifest_sha256": study["manifest_sha256"]} if study else
+                                {"status": "unverified_legacy_assignment"})
+        if row.get("submitted_at"):
+            from datetime import datetime
+            submitted = datetime.fromisoformat(row["submitted_at"].replace("Z", "+00:00"))
+            if submitted.tzinfo is None:
+                raise ValueError("submitted_at must include a timezone")
+            result["submitted_at"] = submitted.isoformat()
         try:
             answer = {field: float(row[field]) for field in PAYLOAD_METRICS if field not in ("buy_now", "timing_days")}
             flag = row["buy_now"].strip().lower()
@@ -1528,10 +1734,16 @@ def import_humans(trials_path, csv_path, output_path):
         result["source_cells"] = raw_cells
         status_counts[result["status"]] += 1
         records.append({"trial": by_id[trial_id], "result": result})
+    if study:
+        from .protocol import administration_summary
+        administration_summary(records)
     write_jsonl(output_path, records)
     return {"records": len(records), "subjects": len({subject for subject, _ in seen}),
+            "study_id": study["study_id"] if study else None,
+            "assignment_verified": study is not None,
             "status_counts": {status: status_counts[status] for status in STATUSES},
-            "output": str(output_path), "warnings": ["Invalid answers retained as invalid, never imputed."] if status_counts["invalid"] else []}
+            "output": str(output_path), "warnings": (["Invalid answers retained as invalid, never imputed."] if status_counts["invalid"] else []) +
+            (["Legacy assignment provenance is unverified; descriptive use only."] if not study else [])}
 
 
 def contextual_series(csv_path, output_dir):

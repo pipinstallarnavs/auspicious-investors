@@ -30,10 +30,13 @@ stays in ``assignments.csv`` and ``design.json``.
 from __future__ import annotations
 
 import csv
+import datetime as dt
 import hashlib
 import io
 import json
 import random
+import re
+import uuid
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -42,7 +45,8 @@ from .core import atomic_text, read_jsonl, validate_trials
 DESIGNS = ("between", "counterbalanced")
 TARGET_CONDITIONS = ("event", "neutral")
 FILLER_CONDITION = "no_calendar"
-ASSIGNMENT_FIELDS = ("subject_id", "position", "trial_id", "kind", "condition", "cluster_id", "pair_id", "language")
+ASSIGNMENT_FIELDS = ("subject_id", "position", "trial_id", "kind", "condition", "cluster_id", "pair_id", "language",
+                     "study_id", "block_id", "session_id", "assigned_at", "prompt_sha256", "language_eligible")
 SURVEY_FIELDS = ("position", "trial_id", "language", "prompt")
 PARTICIPANT_TEMPLATE_FIELDS = (
     "subject_id", "survey_language", "language_proficiency", "financial_literacy",
@@ -265,7 +269,8 @@ def _balance(languages, targets, fillers, states, participant_info, rows):
 
 
 def assign_participants(trials_path, output_dir, *, participants, design, items_per_participant,
-                        filler_fraction=0.3, seed=42, languages=None):
+                        filler_fraction=0.3, seed=42, languages=None, study_id=None,
+                        participant_roster=None, assigned_at=None):
     """Write per-participant survey files plus the assignment table and design report.
 
     ``items_per_participant`` is the total number of items a participant sees
@@ -274,6 +279,12 @@ def assign_participants(trials_path, output_dir, *, participants, design, items_
     number of clusters available in the participant's language.
     """
     _check_arguments(participants, design, items_per_participant, filler_fraction, seed)
+    study_id = study_id or ("study-" + uuid.uuid4().hex[:16])
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{2,63}", study_id):
+        raise ValueError("study_id must be a safe unique study identifier")
+    assigned_at = assigned_at or dt.datetime.now(dt.timezone.utc).isoformat()
+    if dt.datetime.fromisoformat(assigned_at.replace("Z", "+00:00")).tzinfo is None:
+        raise ValueError("Assignment timestamps must include a timezone")
     output = Path(output_dir)
     _check_output_dir(output)
     trials_path = Path(trials_path)
@@ -307,29 +318,64 @@ def assign_participants(trials_path, output_dir, *, participants, design, items_
                              f"need {n_fillers} fillers")
 
     rng = random.Random(seed)
+    roster = None
+    if participant_roster is not None:
+        with open(participant_roster, encoding="utf-8-sig", newline="") as stream:
+            roster = list(csv.DictReader(stream))
+        if len(roster) != participants or len({r.get("subject_id") for r in roster}) != participants:
+            raise ValueError("Participant roster must contain the declared number of unique subjects")
+        if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", r.get("subject_id", "")) or r.get("language") not in used or
+               r.get("language_eligible", "").lower() not in ("true", "1") for r in roster):
+            raise ValueError("Every roster subject must be declared eligible in their survey language")
+        rng.shuffle(roster)
     language_order = list(used)
     rng.shuffle(language_order)
-    arms = {language: rng.sample(TARGET_CONDITIONS, 2) for language in language_order}
+    language_counts = Counter(r["language"] for r in roster) if roster else Counter(
+        language_order[i % len(language_order)] for i in range(participants))
+    arms, blocks = {}, {}
+    for language in language_order:
+        schedule, identifiers = [], []
+        while len(schedule) < language_counts[language]:
+            remaining = language_counts[language] - len(schedule)
+            size = min(4, remaining)
+            values = ["event", "neutral"] * (size // 2)
+            if size % 2:
+                values.append(rng.choice(TARGET_CONDITIONS))
+            rng.shuffle(values)
+            identifiers.extend([f"{language}-B{len(schedule) // 4 + 1:04d}"] * size)
+            schedule.extend(values)
+        arms[language], blocks[language] = schedule, identifiers
+    language_position = Counter()
     states = {language: _State() for language in used}
     rows, surveys, participant_info = [], {}, {}
     for index in range(participants):
-        subject = f"S{index + 1:04d}"
-        language = language_order[index % len(language_order)]
-        arm = arms[language][(index // len(language_order)) % 2] if design == "between" else None
+        person = roster[index] if roster else {}
+        subject = study_id + "-" + person.get("subject_id", f"S{index + 1:04d}")
+        language = person.get("language", language_order[index % len(language_order)])
+        position = language_position[language]
+        arm = arms[language][position] if design == "between" else None
+        block = blocks[language][position]
+        language_position[language] += 1
         participant_items = _participant_items(language, design, arm, n_targets, n_fillers,
                                                targets, fillers, states[language], rng)
-        participant_info[subject] = {"language": language, "arm": arm}
+        participant_info[subject] = {"language": language, "arm": arm, "block_id": block}
         for position, (trial, kind) in enumerate(participant_items, 1):
             rows.append({"subject_id": subject, "position": position, "trial_id": trial["trial_id"], "kind": kind,
                          "condition": trial["condition"], "cluster_id": trial["cluster_id"],
-                         "pair_id": trial["pair_id"], "language": language})
+                         "pair_id": trial["pair_id"], "language": language, "study_id": study_id,
+                         "block_id": block, "session_id": person.get("session_id", "draft_unspecified"),
+                         "assigned_at": assigned_at, "prompt_sha256": trial["prompt_sha256"],
+                         "language_eligible": bool(roster)})
         surveys[subject] = [[position, trial["trial_id"], language, trial["prompt"]]
                             for position, (trial, _kind) in enumerate(participant_items, 1)]
     invariants = _verify(rows, design, n_targets, n_fillers, items)
 
     trials_bytes = trials_path.read_bytes()
     design_report = {
-        "schema_version": 1,
+        "schema_version": 2, "study_id": study_id, "assigned_at": assigned_at,
+        "language_eligibility_verified": roster is not None,
+        "participant_roster_sha256": hashlib.sha256(Path(participant_roster).read_bytes()).hexdigest() if roster else None,
+        "randomization": "randomized permuted blocks within language; block size <=4; conceal master assignments and seed from enrolment staff",
         "status": "draft_assignment_not_yet_fielded",
         "seed": seed,
         "design": design,
@@ -352,6 +398,20 @@ def assign_participants(trials_path, output_dir, *, participants, design, items_
         atomic_text(output / "surveys" / f"{subject}.csv", _csv_text(SURVEY_FIELDS, survey_rows))
     atomic_text(output / "assignments.csv",
                 _csv_text(ASSIGNMENT_FIELDS, [[row[field] for field in ASSIGNMENT_FIELDS] for row in rows]))
+    design_report["assignments_sha256"] = hashlib.sha256((output / "assignments.csv").read_bytes()).hexdigest()
+    target_coverage = defaultdict(Counter)
+    for row in rows:
+        if row["kind"] == "target":
+            target_coverage[row["pair_id"]][row["condition"]] += 1
+    design_report["preflight"] = {
+        "target_pairs_observed": len(target_coverage),
+        "target_pairs_assigned_both_arms": sum(all(c[k] for k in TARGET_CONDITIONS) for c in target_coverage.values()),
+        "target_pairs_missing_assigned_arm": sum(not all(c[k] for k in TARGET_CONDITIONS) for c in target_coverage.values()),
+        "unexposed_target_trials": design_report["balance"]["target_trial_exposure"]["unexposed"],
+        "field_ready": False,
+        "required_before_fielding": ["independent language eligibility and comprehension checks", "masking/suspicion pilot",
+                                     "review exact task/arm coverage", "freeze estimand, weighting, exclusions and stopping",
+                                     "secure assignment concealment and record actual response timestamps"]}
     atomic_text(output / "participants-template.csv", _csv_text(
         PARTICIPANT_TEMPLATE_FIELDS,
         [[subject, info["language"], "", "", "", "", ""] for subject, info in participant_info.items()]))
